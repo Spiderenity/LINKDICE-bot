@@ -26,14 +26,6 @@ LEVEL_TO_VALUE = {
     5: 70,
 }
 
-STAT_COLUMNS = {
-    "공격": "attack",
-    "민첩": "agility",
-    "지능": "intelligence",
-    "행운": "luck",
-}
-
-
 
 DEFAULT_ENEMY_DAMAGE = os.getenv("ENEMY_DAMAGE_DICE", "1d6")
 LINK_API_URL = os.getenv("LINK_API_URL", "").rstrip("/")
@@ -51,7 +43,6 @@ BOMB_DAMAGE_MAX = 14
 PLAYER_ROLE_NAME = os.getenv("PLAYER_ROLE_NAME", "player")
 
 
-MAX_TURN_CHECKBOX_ACTIONS = 10
 
 DICE_RE = re.compile(r"^(?P<count>\d{1,2})d(?P<sides>\d{1,4})(?P<mod>[+-]\d{1,4})?$", re.I)
 
@@ -87,6 +78,7 @@ def init_db() -> None:
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 attack INTEGER,
+                defense INTEGER,
                 agility INTEGER,
                 intelligence INTEGER,
                 luck INTEGER,
@@ -141,6 +133,8 @@ def init_db() -> None:
             """
         )
         player_columns = {row[1] for row in conn.execute("PRAGMA table_info(player_stats)")}
+        if "defense" not in player_columns:
+            conn.execute("ALTER TABLE player_stats ADD COLUMN defense INTEGER")
         if "bombs" not in player_columns:
             conn.execute("ALTER TABLE player_stats ADD COLUMN bombs INTEGER")
         conn.commit()
@@ -175,13 +169,9 @@ def update_player_fields(guild_id: int, user_id: int, **fields: object) -> None:
 
     allowed = {
         "attack",
-        "agility",
-        "intelligence",
-        "luck",
+        "defense",
         "hp",
         "max_hp",
-        "special_name",
-        "special_level",
         "bombs",
     }
     unknown = set(fields) - allowed
@@ -347,18 +337,6 @@ def get_pending_actions(guild_id: int) -> list[sqlite3.Row]:
             (guild_id,),
         ).fetchall()
 
-
-def mark_action_as_attack(guild_id: int, action_id: int, enemy_id: int) -> None:
-    with connect_db() as conn:
-        conn.execute(
-            """
-            UPDATE turn_actions
-            SET counts_as_attack = 1, enemy_id = ?
-            WHERE guild_id = ? AND id = ? AND resolved = 0
-            """,
-            (enemy_id, guild_id, action_id),
-        )
-        conn.commit()
 
 
 def resolve_all_pending_actions(guild_id: int) -> None:
@@ -758,18 +736,7 @@ async def perform_skill_roll(
     level = int(player[column])
     target = LEVEL_TO_VALUE[level]
     roll = roll_d100()
-    result, success = judge_roll(roll, target)
-
-    add_turn_action(
-        guild_id=interaction.guild_id,
-        user_id=interaction.user.id,
-        skill_name=display_name,
-        skill_level=level,
-        target_value=target,
-        roll=roll,
-        result=result,
-        success=success,
-    )
+    result, _ = judge_roll(roll, target)
 
     embed = make_roll_embed(
         title=display_name,
@@ -779,10 +746,9 @@ async def perform_skill_roll(
         target=target,
         roll=roll,
         result=result,
-        footer="이번 턴 판정으로 기록되었습니다.",
+        footer="LINKDICE 판정 결과입니다.",
     )
     await interaction.response.send_message(embed=embed)
-
 
 
 
@@ -859,150 +825,58 @@ async def attack(interaction: discord.Interaction, enemy: str) -> None:
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="민첩", description="민첩 판정을 합니다.")
+@bot.tree.command(name="방어", description="방어 판정을 합니다.")
 @app_commands.guild_only()
-async def agility(interaction: discord.Interaction) -> None:
-    await perform_skill_roll(interaction, "agility", "민첩")
-
-
-@bot.tree.command(name="지능", description="지능 판정을 합니다.")
-@app_commands.guild_only()
-async def intelligence(interaction: discord.Interaction) -> None:
-    await perform_skill_roll(interaction, "intelligence", "지능")
-
-
-@bot.tree.command(name="행운", description="행운 판정을 합니다.")
-@app_commands.guild_only()
-async def luck(interaction: discord.Interaction) -> None:
-    await perform_skill_roll(interaction, "luck", "행운")
-
-
-@bot.tree.command(name="특수", description="자신의 특수 능력 판정을 합니다.")
-@app_commands.guild_only()
-async def special(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        return
-
-    player = get_player(interaction.guild_id, interaction.user.id)
-    if (
-        player is None
-        or player["special_name"] is None
-        or player["special_level"] is None
-    ):
-        await interaction.response.send_message(
-            f"{interaction.user.mention}님의 **특수**가 설정되어 있지 않습니다.\n"
-            "관리자에게 `/세팅`을 요청해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    level = int(player["special_level"])
-    target = LEVEL_TO_VALUE[level]
-    roll = roll_d100()
-    result, success = judge_roll(roll, target)
-    special_name = str(player["special_name"])
-
-    add_turn_action(
-        guild_id=interaction.guild_id,
-        user_id=interaction.user.id,
-        skill_name=f"특수: {special_name}",
-        skill_level=level,
-        target_value=target,
-        roll=roll,
-        result=result,
-        success=success,
-    )
-
-    embed = make_roll_embed(
-        title=f"특수 · {special_name}",
-        actor=interaction.user.display_name,
-        skill_name=f"특수: {special_name}",
-        level=level,
-        target=target,
-        roll=roll,
-        result=result,
-        footer="이번 턴 판정으로 기록되었습니다.",
-    )
-    await interaction.response.send_message(embed=embed)
+async def defense(interaction: discord.Interaction) -> None:
+    await perform_skill_roll(interaction, "defense", "방어")
 
 
 
 
 
 
-
-@bot.tree.command(name="세팅", description="플레이어의 LINKDICE 능력치를 설정합니다.")
+@bot.tree.command(name="세팅", description="플레이어의 LINKDICE 판정 수치를 설정합니다.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.rename(
     member="유저",
     attack_value="공격",
-    agility_value="민첩",
-    intelligence_value="지능",
-    luck_value="행운",
-    special_name="특수",
-    special_value="특수값",
+    defense_value="방어",
 )
 @app_commands.describe(
     member="설정할 유저",
     attack_value="공격 레벨 (1~5)",
-    agility_value="민첩 레벨 (1~5)",
-    intelligence_value="지능 레벨 (1~5)",
-    luck_value="행운 레벨 (1~5)",
-    special_name="특수 능력 이름 (예: 재봉)",
-    special_value="특수 능력 레벨 (1~5)",
+    defense_value="방어 레벨 (1~5)",
 )
 async def setup_stats(
     interaction: discord.Interaction,
     member: discord.Member,
     attack_value: Optional[int] = None,
-    agility_value: Optional[int] = None,
-    intelligence_value: Optional[int] = None,
-    luck_value: Optional[int] = None,
-    special_name: Optional[str] = None,
-    special_value: Optional[int] = None,
+    defense_value: Optional[int] = None,
 ) -> None:
-    levels = [attack_value, agility_value, intelligence_value, luck_value, special_value]
+    levels = [attack_value, defense_value]
     if any(value is not None and value not in LEVEL_TO_VALUE for value in levels):
         await interaction.response.send_message(
             "능력치 레벨은 **1~5** 사이여야 합니다.", ephemeral=True
         )
         return
-    if (special_name is None) != (special_value is None):
-        await interaction.response.send_message(
-            "특수를 설정하려면 **특수 이름**과 **특수값**을 함께 입력해주세요.",
-            ephemeral=True,
-        )
-        return
-    if all(value is None for value in levels) and special_name is None:
+    if all(value is None for value in levels):
         await interaction.response.send_message(
             "변경할 값을 하나 이상 입력해주세요.", ephemeral=True
         )
         return
+
     fields: dict[str, object] = {}
     changes: list[str] = []
     for column, value, label in (
         ("attack", attack_value, "공격"),
-        ("agility", agility_value, "민첩"),
-        ("intelligence", intelligence_value, "지능"),
-        ("luck", luck_value, "행운"),
+        ("defense", defense_value, "방어"),
     ):
         if value is not None:
             fields[column] = value
             changes.append(f"{label}: Lv.{value} ({LEVEL_TO_VALUE[value]})")
-    if special_name is not None and special_value is not None:
-        cleaned_name = special_name.strip()
-        if not cleaned_name:
-            await interaction.response.send_message(
-                "특수 이름을 입력해주세요.", ephemeral=True
-            )
-            return
-        fields["special_name"] = cleaned_name
-        fields["special_level"] = special_value
-        changes.append(
-            f"특수: {cleaned_name} Lv.{special_value} ({LEVEL_TO_VALUE[special_value]})"
-        )
+
     update_player_fields(interaction.guild_id, member.id, **fields)
     await interaction.response.send_message(
         f"**{member.display_name}** 설정 완료\n" + "\n".join(f"- {c}" for c in changes),
@@ -1024,11 +898,6 @@ async def stats(
     ensure_player(interaction.guild_id, target_member.id)
     player = get_player(interaction.guild_id, target_member.id)
     profile, connected = await get_effective_profile(interaction.guild_id, target_member.id)
-    special_text = (
-        f"{player['special_name']} — {stat_text(player['special_level'])}"
-        if player["special_name"] is not None and player["special_level"] is not None
-        else "미설정"
-    )
     ring = profile.get("ring")
     head = profile.get("head")
     hp_sync, bombs_sync = get_sync_settings(interaction.guild_id)
@@ -1037,10 +906,7 @@ async def stats(
         name="판정",
         value=(
             f"공격 · {stat_text(player['attack'])}\n"
-            f"민첩 · {stat_text(player['agility'])}\n"
-            f"지능 · {stat_text(player['intelligence'])}\n"
-            f"행운 · {stat_text(player['luck'])}\n"
-            f"특수 · {special_text}"
+            f"방어 · {stat_text(player['defense'])}"
         ),
         inline=False,
     )
@@ -1522,159 +1388,6 @@ async def resolve_turn(
     return "턴 종료 처리 완료."
 
 
-class TargetSelect(discord.ui.Select):
-    def __init__(self, parent_view: "TargetAssignmentView") -> None:
-        self.parent_view = parent_view
-        enemies = get_active_enemies(parent_view.guild.id, include_down=False)
-        options = [
-            discord.SelectOption(
-                label=enemy_display_name(enemy)[:100],
-                value=str(enemy["id"]),
-                description=f"HP {enemy['hp']}/{enemy['max_hp']}"[:100],
-            )
-            for enemy in enemies[:25]
-        ]
-        super().__init__(
-            placeholder="이 판정이 공격한 에너미를 선택하세요.",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.parent_view.admin_id:
-            await interaction.response.send_message(
-                "`/턴 종료`를 실행한 관리자만 조작할 수 있습니다.", ephemeral=True
-            )
-            return
-
-        enemy_id = int(self.values[0])
-        action = self.parent_view.current_action
-        mark_action_as_attack(self.parent_view.guild.id, int(action["id"]), enemy_id)
-        self.parent_view.index += 1
-
-        if self.parent_view.index >= len(self.parent_view.actions):
-            self.parent_view.stop()
-            await interaction.response.edit_message(
-                content="대상 지정 완료. 데미지를 계산합니다.",
-                view=None,
-            )
-            await resolve_turn(self.parent_view.guild, interaction.channel)
-            return
-
-        self.parent_view.rebuild()
-        await interaction.response.edit_message(
-            content=self.parent_view.prompt_text(),
-            view=self.parent_view,
-        )
-
-
-class TargetAssignmentView(discord.ui.View):
-    def __init__(
-        self,
-        guild: discord.Guild,
-        admin_id: int,
-        actions: list[sqlite3.Row],
-    ) -> None:
-        super().__init__(timeout=300)
-        self.guild = guild
-        self.admin_id = admin_id
-        self.actions = actions
-        self.index = 0
-        self.rebuild()
-
-    @property
-    def current_action(self) -> sqlite3.Row:
-        return self.actions[self.index]
-
-    def prompt_text(self) -> str:
-        action = self.current_action
-        return (
-            f"**공격 대상 지정 {self.index + 1}/{len(self.actions)}**\n"
-            f"{member_label(self.guild, action['user_id'])} — "
-            f"{action['skill_name']} {action['result']} ({action['roll']}/{action['target_value']})"
-        )
-
-    def rebuild(self) -> None:
-        self.clear_items()
-        enemies = get_active_enemies(self.guild.id, include_down=False)
-        if enemies:
-            self.add_item(TargetSelect(self))
-
-
-class TurnAttackSelectionModal(discord.ui.Modal):
-    def __init__(
-        self,
-        guild: discord.Guild,
-        admin_id: int,
-        actions: list[sqlite3.Row],
-    ) -> None:
-        super().__init__(title="턴 종료 — 공격 판정 선택")
-        self.guild = guild
-        self.admin_id = admin_id
-        self.actions = actions
-
-        checkbox_group = discord.ui.CheckboxGroup(
-            required=False,
-            min_values=0,
-            max_values=len(actions),
-        )
-        for action in actions:
-            checkbox_group.add_option(
-                label=(
-                    f"{member_label(guild, action['user_id'])} — {action['skill_name']}"
-                )[:100],
-                value=str(action["id"]),
-                description=(
-                    f"{action['result']} · {action['roll']}/{action['target_value']}"
-                )[:100],
-            )
-
-        self.attack_choices = checkbox_group
-        self.add_item(
-            discord.ui.Label(
-                text="공격으로 처리할 판정",
-                description="체크한 판정만 데미지를 발생시킵니다.",
-                component=checkbox_group,
-            )
-        )
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        selected_ids = {int(value) for value in self.attack_choices.values}
-        selected_actions = [
-            action for action in self.actions if int(action["id"]) in selected_ids
-        ]
-
-        if not selected_actions:
-            await interaction.response.send_message(
-                "추가 공격 판정이 없습니다. 데미지를 계산합니다.",
-                ephemeral=True,
-            )
-            await resolve_turn(self.guild, interaction.channel)
-            return
-
-        enemies = get_active_enemies(self.guild.id, include_down=False)
-        if not enemies:
-            await interaction.response.send_message(
-                "공격 대상으로 지정할 수 있는 에너미가 없습니다. "
-                "추가 판정은 공격으로 처리하지 않고 턴을 종료합니다.",
-                ephemeral=True,
-            )
-            await resolve_turn(self.guild, interaction.channel)
-            return
-
-        view = TargetAssignmentView(
-            guild=self.guild,
-            admin_id=self.admin_id,
-            actions=selected_actions,
-        )
-        await interaction.response.send_message(
-            view.prompt_text(),
-            view=view,
-            ephemeral=True,
-        )
-
-
 turn_group = app_commands.Group(name="턴", description="턴을 관리합니다.")
 
 
@@ -1690,40 +1403,13 @@ async def turn_end(interaction: discord.Interaction) -> None:
     actions = get_pending_actions(guild.id)
     if not actions:
         await interaction.response.send_message(
-            "이번 턴에 처리할 판정이 없습니다.", ephemeral=True
+            "이번 턴에 처리할 공격 판정이 없습니다.", ephemeral=True
         )
         return
 
-    
-    optional_attack_actions = [
-        action
-        for action in actions
-        if action["success"] and not action["direct_attack"]
-    ]
-
-    if not optional_attack_actions:
-        await interaction.response.defer(ephemeral=True)
-        await resolve_turn(guild, interaction.channel)
-        await interaction.followup.send("턴 종료 처리 완료.", ephemeral=True)
-        return
-
-    if len(optional_attack_actions) > MAX_TURN_CHECKBOX_ACTIONS:
-        await interaction.response.send_message(
-            f"이번 턴의 공격 여부 확인 대상이 {len(optional_attack_actions)}개입니다. "
-            f"현재 체크박스 UI는 한 번에 {MAX_TURN_CHECKBOX_ACTIONS}개까지 지원합니다. "
-            "턴 판정 수를 줄인 뒤 다시 시도해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.send_modal(
-        TurnAttackSelectionModal(
-            guild=guild,
-            admin_id=interaction.user.id,
-            actions=optional_attack_actions,
-        )
-    )
-
+    await interaction.response.defer(ephemeral=True)
+    await resolve_turn(guild, interaction.channel)
+    await interaction.followup.send("턴 종료 처리 완료.", ephemeral=True)
 
 
 
