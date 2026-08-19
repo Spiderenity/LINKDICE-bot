@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import random
 import re
 import sqlite3
-from collections import defaultdict
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,24 +15,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-
-
-
-
-
-LEVEL_TO_VALUE = {
-    1: 30,
-    2: 40,
-    3: 50,
-    4: 60,
-    5: 70,
-}
-
-
 DEFAULT_ENEMY_DAMAGE = os.getenv("ENEMY_DAMAGE_DICE", "1d6")
 LINK_API_URL = os.getenv("LINK_API_URL", "").rstrip("/")
 LINKDICE_API_KEY = os.getenv("LINKDICE_API_KEY", "").strip()
 LINK_API_TIMEOUT = float(os.getenv("LINK_API_TIMEOUT", "4"))
+PLAYER_ROLE_NAME = os.getenv("PLAYER_ROLE_NAME", "player")
+
 FALLBACK_WEAPON_NAME = "유리 파편"
 FALLBACK_ATTACK_POWER = 4
 FALLBACK_SHIELD_NAME = "화물 상자 뚜껑"
@@ -40,16 +30,50 @@ FALLBACK_BOMBS = 2
 BOMB_DAMAGE_MIN = 10
 BOMB_DAMAGE_MAX = 14
 
-PLAYER_ROLE_NAME = os.getenv("PLAYER_ROLE_NAME", "player")
-
-
+ATTACK_PERFECT = 0.85
+ATTACK_GOOD = 1.25
+DEFENSE_PERFECT = 0.90
+DEFENSE_GOOD = 1.30
 
 DICE_RE = re.compile(r"^(?P<count>\d{1,2})d(?P<sides>\d{1,4})(?P<mod>[+-]\d{1,4})?$", re.I)
 
-
-
-
-
+ATTACK_FLAVOR = [
+    "아직인가...",
+    "좀만 더 보자...",
+    "가만히 있네...",
+    "타이밍 잡기 어렵네...",
+    "계속 지켜보자...",
+]
+ATTACK_FAKEOUT = [
+    "**💥 앗!!! 멀쩡히 서 있다!!!**",
+    "**💥 앗!!! 이쪽을 쳐다본다!!!**",
+    "**💥 앗!!! 괜히 한 바퀴 돌았다!!!**",
+    "**💥 앗!!! 아무 일도 없었다!!!**",
+]
+ATTACK_REAL = [
+    "**💥 앗!!! 지금이야!!!**",
+    "**💥 앗!!! 기회다!!!**",
+]
+DEFEND_FLAVOR = [
+    "아직인가...",
+    "언제 치려나...",
+    "좀만 더 보자...",
+    "가만히 있네...",
+    "뭘 하려는 거지...",
+    "계속 지켜보자...",
+]
+DEFEND_FAKEOUT = [
+    "**💥 앗!!! 아무 일도 없다!!!**",
+    "**💥 앗!!! 그냥 쳐다본다!!!**",
+    "**💥 앗!!! 가만히 서 있다!!!**",
+    "**💥 앗!!! 괜히 움직였다!!!**",
+    "**💥 앗!!! 다시 멈춰 섰다!!!**",
+    "**💥 앗!!! 그냥 지나간다!!!**",
+]
+DEFEND_REAL = [
+    "**💥 앗!!! 공격한다!!!**",
+    "**💥 앗!!! 지금 막아!!!**",
+]
 
 
 def get_db_path() -> Path:
@@ -104,92 +128,101 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_active_enemies_guild
             ON active_enemies (guild_id, active, hp);
 
-            CREATE TABLE IF NOT EXISTS turn_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                skill_name TEXT NOT NULL,
-                skill_level INTEGER NOT NULL,
-                target_value INTEGER NOT NULL,
-                roll INTEGER NOT NULL,
-                result TEXT NOT NULL,
-                success INTEGER NOT NULL,
-                enemy_id INTEGER,
-                direct_attack INTEGER NOT NULL DEFAULT 0,
-                counts_as_attack INTEGER NOT NULL DEFAULT 0,
-                resolved INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (enemy_id) REFERENCES active_enemies(id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_turn_actions_guild
-            ON turn_actions (guild_id, resolved, id);
-
             CREATE TABLE IF NOT EXISTS sync_settings (
                 guild_id INTEGER PRIMARY KEY,
                 hp_sync INTEGER NOT NULL DEFAULT 1,
                 bombs_sync INTEGER NOT NULL DEFAULT 1
             );
+
+            CREATE TABLE IF NOT EXISTS trpg_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                turn_number INTEGER NOT NULL DEFAULT 1,
+                turn_locked INTEGER NOT NULL DEFAULT 0,
+                resolving INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_session
+            ON trpg_sessions (guild_id)
+            WHERE active = 1;
+
+            CREATE TABLE IF NOT EXISTS trpg_participants (
+                session_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY (session_id, user_id),
+                FOREIGN KEY (session_id) REFERENCES trpg_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS trpg_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                turn_number INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                action_name TEXT NOT NULL,
+                grade TEXT,
+                elapsed REAL,
+                enemy_id INTEGER,
+                attack_power INTEGER,
+                weapon_name TEXT,
+                link_connected INTEGER NOT NULL DEFAULT 0,
+                custom_attack INTEGER,
+                custom_enemy_id INTEGER,
+                custom_attack_power INTEGER,
+                bomb_damage INTEGER NOT NULL DEFAULT 0,
+                finalized INTEGER NOT NULL DEFAULT 0,
+                resolved INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TEXT,
+                UNIQUE (session_id, turn_number, user_id),
+                FOREIGN KEY (session_id) REFERENCES trpg_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trpg_actions_turn
+            ON trpg_actions (session_id, turn_number, resolved, user_id);
             """
         )
         player_columns = {row[1] for row in conn.execute("PRAGMA table_info(player_stats)")}
-        if "defense" not in player_columns:
-            conn.execute("ALTER TABLE player_stats ADD COLUMN defense INTEGER")
         if "bombs" not in player_columns:
             conn.execute("ALTER TABLE player_stats ADD COLUMN bombs INTEGER")
+        if "defense" not in player_columns:
+            conn.execute("ALTER TABLE player_stats ADD COLUMN defense INTEGER")
+        conn.commit()
+
+
+def ensure_player(guild_id: int, user_id: int) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO player_stats (guild_id, user_id) VALUES (?, ?)",
+            (guild_id, user_id),
+        )
         conn.commit()
 
 
 def get_player(guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
     with connect_db() as conn:
         return conn.execute(
-            """
-            SELECT * FROM player_stats
-            WHERE guild_id = ? AND user_id = ?
-            """,
+            "SELECT * FROM player_stats WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
-
-
-def ensure_player(guild_id: int, user_id: int) -> None:
-    with connect_db() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO player_stats (guild_id, user_id)
-            VALUES (?, ?)
-            """,
-            (guild_id, user_id),
-        )
-        conn.commit()
 
 
 def update_player_fields(guild_id: int, user_id: int, **fields: object) -> None:
     if not fields:
         return
-
-    allowed = {
-        "attack",
-        "defense",
-        "hp",
-        "max_hp",
-        "bombs",
-    }
+    allowed = {"hp", "max_hp", "bombs"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"Unknown player fields: {unknown}")
-
     ensure_player(guild_id, user_id)
-
     assignments = ", ".join(f"{column} = ?" for column in fields)
     values = list(fields.values()) + [guild_id, user_id]
-
     with connect_db() as conn:
         conn.execute(
-            f"""
-            UPDATE player_stats
-            SET {assignments}, updated_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND user_id = ?
-            """,
+            f"UPDATE player_stats SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ? AND user_id = ?",
             values,
         )
         conn.commit()
@@ -197,10 +230,7 @@ def update_player_fields(guild_id: int, user_id: int, **fields: object) -> None:
 
 def get_sync_settings(guild_id: int) -> tuple[bool, bool]:
     with connect_db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO sync_settings (guild_id) VALUES (?)",
-            (guild_id,),
-        )
+        conn.execute("INSERT OR IGNORE INTO sync_settings (guild_id) VALUES (?)", (guild_id,))
         row = conn.execute(
             "SELECT hp_sync, bombs_sync FROM sync_settings WHERE guild_id = ?",
             (guild_id,),
@@ -233,17 +263,11 @@ def set_sync_settings(
 
 
 def get_active_enemies(guild_id: int, include_down: bool = True) -> list[sqlite3.Row]:
-    query = """
-        SELECT * FROM active_enemies
-        WHERE guild_id = ? AND active = 1
-    """
+    query = "SELECT * FROM active_enemies WHERE guild_id = ? AND active = 1"
     params: list[object] = [guild_id]
-
     if not include_down:
         query += " AND hp > 0"
-
     query += " ORDER BY id ASC"
-
     with connect_db() as conn:
         return conn.execute(query, params).fetchall()
 
@@ -251,10 +275,7 @@ def get_active_enemies(guild_id: int, include_down: bool = True) -> list[sqlite3
 def get_enemy(guild_id: int, enemy_id: int) -> Optional[sqlite3.Row]:
     with connect_db() as conn:
         return conn.execute(
-            """
-            SELECT * FROM active_enemies
-            WHERE guild_id = ? AND id = ? AND active = 1
-            """,
+            "SELECT * FROM active_enemies WHERE guild_id = ? AND id = ? AND active = 1",
             (guild_id, enemy_id),
         ).fetchone()
 
@@ -262,10 +283,7 @@ def get_enemy(guild_id: int, enemy_id: int) -> Optional[sqlite3.Row]:
 def spawn_enemy(guild_id: int, name: str, hp: int) -> int:
     with connect_db() as conn:
         cursor = conn.execute(
-            """
-            INSERT INTO active_enemies (guild_id, name, hp, max_hp)
-            VALUES (?, ?, ?, ?)
-            """,
+            "INSERT INTO active_enemies (guild_id, name, hp, max_hp) VALUES (?, ?, ?, ?)",
             (guild_id, name, hp, hp),
         )
         conn.commit()
@@ -275,142 +293,225 @@ def spawn_enemy(guild_id: int, name: str, hp: int) -> int:
 def deactivate_enemy(guild_id: int, enemy_id: int) -> bool:
     with connect_db() as conn:
         cursor = conn.execute(
-            """
-            UPDATE active_enemies
-            SET active = 0
-            WHERE guild_id = ? AND id = ? AND active = 1
-            """,
+            "UPDATE active_enemies SET active = 0 WHERE guild_id = ? AND id = ? AND active = 1",
             (guild_id, enemy_id),
         )
         conn.commit()
         return cursor.rowcount > 0
 
 
-def add_turn_action(
-    guild_id: int,
+def get_active_session(guild_id: int) -> Optional[sqlite3.Row]:
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT * FROM trpg_sessions WHERE guild_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+            (guild_id,),
+        ).fetchone()
+
+
+def create_session(guild_id: int, user_ids: list[int]) -> sqlite3.Row:
+    with connect_db() as conn:
+        old = conn.execute(
+            "SELECT id FROM trpg_sessions WHERE guild_id = ? AND active = 1",
+            (guild_id,),
+        ).fetchone()
+        if old is not None:
+            raise ValueError("이미 진행 중인 세션이 있습니다.")
+        cursor = conn.execute(
+            "INSERT INTO trpg_sessions (guild_id, active, turn_number, turn_locked, resolving) VALUES (?, 1, 1, 0, 0)",
+            (guild_id,),
+        )
+        session_id = int(cursor.lastrowid)
+        conn.executemany(
+            "INSERT INTO trpg_participants (session_id, user_id) VALUES (?, ?)",
+            [(session_id, user_id) for user_id in user_ids],
+        )
+        conn.commit()
+    session = get_active_session(guild_id)
+    if session is None:
+        raise RuntimeError("세션 생성에 실패했습니다.")
+    return session
+
+
+def end_session(guild_id: int) -> bool:
+    with connect_db() as conn:
+        cursor = conn.execute(
+            "UPDATE trpg_sessions SET active = 0, turn_locked = 1, resolving = 0 WHERE guild_id = ? AND active = 1",
+            (guild_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_participant_ids(session_id: int) -> list[int]:
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM trpg_participants WHERE session_id = ? ORDER BY user_id",
+            (session_id,),
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def is_participant(session_id: int, user_id: int) -> bool:
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM trpg_participants WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+    return row is not None
+
+
+def get_turn_action(session_id: int, turn_number: int, user_id: int) -> Optional[sqlite3.Row]:
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT * FROM trpg_actions WHERE session_id = ? AND turn_number = ? AND user_id = ?",
+            (session_id, turn_number, user_id),
+        ).fetchone()
+
+
+def reserve_action(
+    session: sqlite3.Row,
     user_id: int,
-    skill_name: str,
-    skill_level: int,
-    target_value: int,
-    roll: int,
-    result: str,
-    success: bool,
+    kind: str,
+    action_name: str,
     enemy_id: Optional[int] = None,
-    direct_attack: bool = False,
+    attack_power: Optional[int] = None,
+    weapon_name: Optional[str] = None,
+    link_connected: bool = False,
 ) -> int:
     with connect_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO turn_actions (
-                guild_id, user_id, skill_name, skill_level,
-                target_value, roll, result, success,
-                enemy_id, direct_attack, counts_as_attack
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trpg_actions (
+                session_id, guild_id, turn_number, user_id, kind, action_name,
+                enemy_id, attack_power, weapon_name, link_connected, finalized
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
             (
-                guild_id,
+                int(session["id"]),
+                int(session["guild_id"]),
+                int(session["turn_number"]),
                 user_id,
-                skill_name,
-                skill_level,
-                target_value,
-                roll,
-                result,
-                int(success),
+                kind,
+                action_name,
                 enemy_id,
-                int(direct_attack),
-                int(direct_attack),
+                attack_power,
+                weapon_name,
+                int(link_connected),
             ),
         )
         conn.commit()
         return int(cursor.lastrowid)
 
 
-def get_pending_actions(guild_id: int) -> list[sqlite3.Row]:
-    with connect_db() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM turn_actions
-            WHERE guild_id = ? AND resolved = 0
-            ORDER BY id ASC
-            """,
-            (guild_id,),
-        ).fetchall()
-
-
-
-def resolve_all_pending_actions(guild_id: int) -> None:
+def finalize_action(action_id: int, grade: str, elapsed: Optional[float]) -> None:
     with connect_db() as conn:
         conn.execute(
             """
-            UPDATE turn_actions
-            SET resolved = 1
-            WHERE guild_id = ? AND resolved = 0
+            UPDATE trpg_actions
+            SET grade = ?, elapsed = ?, finalized = 1, finalized_at = CURRENT_TIMESTAMP
+            WHERE id = ?
             """,
-            (guild_id,),
+            (grade, elapsed, action_id),
         )
         conn.commit()
 
 
+def finalize_bomb_action(action_id: int, damage: int) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE trpg_actions
+            SET grade = 'BOMB', bomb_damage = ?, finalized = 1, finalized_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (damage, action_id),
+        )
+        conn.commit()
 
 
+def delete_action(action_id: int) -> None:
+    with connect_db() as conn:
+        conn.execute("DELETE FROM trpg_actions WHERE id = ?", (action_id,))
+        conn.commit()
 
 
-
-def roll_d100() -> int:
-    return random.randint(1, 100)
-
-
-def judge_roll(roll: int, target: int) -> tuple[str, bool]:
-    if roll == 1:
-        return "대성공", True
-
-    if (target < 50 and roll >= 96) or (target >= 50 and roll == 100):
-        return "대실패", False
-
-    if roll <= target // 5:
-        return "극단적 성공", True
-
-    if roll <= target // 2:
-        return "어려운 성공", True
-
-    if roll <= target:
-        return "성공", True
-
-    return "실패", False
+def get_turn_actions(session_id: int, turn_number: int) -> list[sqlite3.Row]:
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT * FROM trpg_actions WHERE session_id = ? AND turn_number = ? ORDER BY id",
+            (session_id, turn_number),
+        ).fetchall()
 
 
-def parse_and_roll_dice(expression: str) -> tuple[int, list[int], int]:
-    normalized = expression.replace(" ", "").lower()
-    match = DICE_RE.fullmatch(normalized)
-    if not match:
-        raise ValueError("주사위식은 1d6, 2d4+1 같은 형식이어야 합니다.")
-
-    count = int(match.group("count"))
-    sides = int(match.group("sides"))
-    modifier = int(match.group("mod") or 0)
-
-    if count < 1 or count > 20:
-        raise ValueError("주사위 개수는 1~20개만 사용할 수 있습니다.")
-    if sides < 2 or sides > 1000:
-        raise ValueError("주사위 면수는 2~1000만 사용할 수 있습니다.")
-
-    rolls = [random.randint(1, sides) for _ in range(count)]
-    total = max(0, sum(rolls) + modifier)
-    return total, rolls, modifier
+def get_missing_participants(session: sqlite3.Row) -> list[int]:
+    participant_ids = get_participant_ids(int(session["id"]))
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id FROM trpg_actions
+            WHERE session_id = ? AND turn_number = ? AND finalized = 1
+            """,
+            (int(session["id"]), int(session["turn_number"])),
+        ).fetchall()
+    done = {int(row["user_id"]) for row in rows}
+    return [user_id for user_id in participant_ids if user_id not in done]
 
 
-def damage_expression_for_attack_power(attack_power: int) -> str:
-    return f"1d{max(1, attack_power)}"
+def lock_turn(session_id: int) -> None:
+    with connect_db() as conn:
+        conn.execute("UPDATE trpg_sessions SET turn_locked = 1 WHERE id = ?", (session_id,))
+        conn.commit()
 
 
-def format_dice_roll(expression: str, rolls: list[int], modifier: int, total: int) -> str:
-    detail = " + ".join(str(r) for r in rolls)
-    if modifier > 0:
-        detail += f" + {modifier}"
-    elif modifier < 0:
-        detail += f" - {abs(modifier)}"
-    return f"`{expression}` → {detail} = **{total}**"
+def set_resolving(session_id: int, value: bool) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE trpg_sessions SET resolving = ?, turn_locked = 1 WHERE id = ?",
+            (int(value), session_id),
+        )
+        conn.commit()
+
+
+def advance_turn(session_id: int) -> int:
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE trpg_sessions
+            SET turn_number = turn_number + 1, turn_locked = 0, resolving = 0
+            WHERE id = ? AND active = 1
+            """,
+            (session_id,),
+        )
+        row = conn.execute("SELECT turn_number FROM trpg_sessions WHERE id = ?", (session_id,)).fetchone()
+        conn.commit()
+    return int(row["turn_number"])
+
+
+def set_custom_action_resolution(
+    action_id: int,
+    is_attack: bool,
+    enemy_id: Optional[int] = None,
+    attack_power: Optional[int] = None,
+) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE trpg_actions
+            SET custom_attack = ?, custom_enemy_id = ?, custom_attack_power = ?
+            WHERE id = ?
+            """,
+            (int(is_attack), enemy_id, attack_power, action_id),
+        )
+        conn.commit()
+
+
+def mark_turn_actions_resolved(session_id: int, turn_number: int) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE trpg_actions SET resolved = 1 WHERE session_id = ? AND turn_number = ?",
+            (session_id, turn_number),
+        )
+        conn.commit()
 
 
 def fallback_link_profile() -> dict:
@@ -457,20 +558,10 @@ async def get_effective_profile(guild_id: int, user_id: int) -> tuple[dict, bool
     hp_sync, bombs_sync = get_sync_settings(guild_id)
 
     if remote is not None and hp_sync:
-        update_player_fields(
-            guild_id,
-            user_id,
-            hp=int(remote["hp"]),
-            max_hp=int(remote["max_hp"]),
-        )
+        update_player_fields(guild_id, user_id, hp=int(remote["hp"]), max_hp=int(remote["max_hp"]))
         local = get_player(guild_id, user_id)
     elif local is None or local["hp"] is None or local["max_hp"] is None:
-        update_player_fields(
-            guild_id,
-            user_id,
-            hp=int(profile["hp"]),
-            max_hp=int(profile["max_hp"]),
-        )
+        update_player_fields(guild_id, user_id, hp=int(profile["hp"]), max_hp=int(profile["max_hp"]))
         local = get_player(guild_id, user_id)
 
     if remote is not None and bombs_sync:
@@ -496,7 +587,7 @@ async def write_link_resources(
     hp: Optional[int] = None,
     bombs: Optional[int] = None,
 ) -> bool:
-    payload = {}
+    payload: dict[str, int] = {}
     if hp is not None:
         payload["hp"] = int(hp)
     if bombs is not None:
@@ -506,7 +597,7 @@ async def write_link_resources(
     result = await link_api_request("PATCH", guild_id, user_id, payload)
     if result is None:
         return False
-    fields = {}
+    fields: dict[str, int] = {}
     if "hp" in payload:
         fields["hp"] = int(result["hp"])
         fields["max_hp"] = int(result["max_hp"])
@@ -516,9 +607,28 @@ async def write_link_resources(
     return True
 
 
+def parse_and_roll_dice(expression: str) -> tuple[int, list[int], int]:
+    normalized = expression.replace(" ", "").lower()
+    match = DICE_RE.fullmatch(normalized)
+    if not match:
+        raise ValueError("주사위식은 1d6, 2d4+1 같은 형식이어야 합니다.")
+    count = int(match.group("count"))
+    sides = int(match.group("sides"))
+    modifier = int(match.group("mod") or 0)
+    if count < 1 or count > 20 or sides < 2 or sides > 1000:
+        raise ValueError("주사위식 범위를 확인해주세요.")
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    total = max(0, sum(rolls) + modifier)
+    return total, rolls, modifier
 
 
-
+def format_dice_roll(expression: str, rolls: list[int], modifier: int, total: int) -> str:
+    detail = " + ".join(str(r) for r in rolls)
+    if modifier > 0:
+        detail += f" + {modifier}"
+    elif modifier < 0:
+        detail += f" - {abs(modifier)}"
+    return f"`{expression}` → {detail} = **{total}**"
 
 
 def enemy_display_name(enemy: sqlite3.Row) -> str:
@@ -533,104 +643,64 @@ def hp_bar(current: int, maximum: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def stat_text(level: Optional[int]) -> str:
-    if level is None:
-        return "미설정"
-    return f"Lv.{level} ({LEVEL_TO_VALUE[level]})"
-
-
 def member_label(guild: discord.Guild, user_id: int) -> str:
     member = guild.get_member(user_id)
     return member.display_name if member else f"<@{user_id}>"
 
 
-def result_color(result: str) -> discord.Colour:
-    if result == "대성공":
+def grade_color(grade: str) -> discord.Colour:
+    if grade == "PERFECT":
         return discord.Colour.gold()
-    if result in ("극단적 성공", "어려운 성공", "성공"):
+    if grade == "GOOD":
         return discord.Colour.green()
-    if result == "대실패":
-        return discord.Colour.red()
-    return discord.Colour.light_grey()
+    return discord.Colour.red()
 
 
-def make_roll_embed(
-    title: str,
-    actor: str,
-    skill_name: str,
-    level: int,
-    target: int,
-    roll: int,
-    result: str,
-    footer: Optional[str] = None,
-    target_name: Optional[str] = None,
-) -> discord.Embed:
-    lines = [f"캐릭터 · `{actor}`"]
-    if target_name:
-        lines.append(f"대상 · `{target_name}`")
-    lines.extend(
-        [
-            f"판정 · `{skill_name}`",
-            f"수치 · `Lv.{level}` → **{target}**",
-            f"다이스 · `1d100` → **{roll}**",
-            f"결과 · **{result}**",
-        ]
-    )
-    embed = discord.Embed(
-        title=title,
-        description="\n".join(lines),
-        color=result_color(result),
-    )
-    if footer:
-        embed.set_footer(text=footer)
-    return embed
+def grade_damage(power: int, grade: str) -> int:
+    if grade == "PERFECT":
+        return max(1, round(power * 1.40))
+    if grade == "GOOD":
+        return max(1, int(power))
+    return 0
 
 
-
-
-
+def defense_damage(raw_damage: int, defense_power: int, grade: str) -> int:
+    if raw_damage <= 0:
+        return 0
+    if grade == "PERFECT":
+        return 0
+    damage = raw_damage
+    if grade == "GOOD":
+        damage = max(1, round(damage * 0.45))
+    damage = max(0, damage - max(0, defense_power))
+    if grade == "MISS":
+        damage = max(1, damage)
+    return damage
 
 
 class LinkDiceBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        
         intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
         init_db()
-
         self.tree.add_command(enemy_group)
         self.tree.add_command(player_group)
         self.tree.add_command(turn_group)
-
-        synced_global = await self.tree.sync()
-        print(f"Global commands synced: {len(synced_global)}")
-
-        test_guild_id = os.getenv("TEST_GUILD_ID")
-        if test_guild_id:
-            guild = discord.Object(id=int(test_guild_id))
-            self.tree.clear_commands(guild=guild)
-            await self.tree.sync(guild=guild)
-            self.tree.copy_global_to(guild=guild)
-            synced_guild = await self.tree.sync(guild=guild)
-            print(f"Fresh guild commands synced to {test_guild_id}: {len(synced_guild)}")
+        await self.tree.sync()
+        print("Global commands synced")
 
 
 bot = LinkDiceBot()
+active_timing_games: dict[tuple[int, int], "TimingGame"] = {}
 
 
 @bot.event
 async def on_ready() -> None:
-    print("LINKDICE BUILD: setup-self-fix-20260819")
     print(f"Logged in as {bot.user}")
     print(f"Database: {DB_PATH}")
-
-
-
-
-
 
 
 async def enemy_autocomplete(
@@ -639,17 +709,11 @@ async def enemy_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None:
         return []
-
-    current_lower = current.lower().strip()
-    enemies = get_active_enemies(interaction.guild_id, include_down=False)
-
+    needle = current.lower().strip()
     choices: list[app_commands.Choice[str]] = []
-    for enemy in enemies:
-        label = (
-            f"{enemy_display_name(enemy)} — "
-            f"HP {enemy['hp']}/{enemy['max_hp']}"
-        )
-        if current_lower and current_lower not in label.lower():
+    for enemy in get_active_enemies(interaction.guild_id, include_down=False):
+        label = f"{enemy_display_name(enemy)} — HP {enemy['hp']}/{enemy['max_hp']}"
+        if needle and needle not in label.lower():
             continue
         choices.append(app_commands.Choice(name=label[:100], value=str(enemy["id"])))
         if len(choices) >= 25:
@@ -663,15 +727,12 @@ async def any_active_enemy_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None:
         return []
-
-    current_lower = current.lower().strip()
-    enemies = get_active_enemies(interaction.guild_id, include_down=True)
+    needle = current.lower().strip()
     choices: list[app_commands.Choice[str]] = []
-
-    for enemy in enemies:
-        state = "DOWN" if enemy["hp"] <= 0 else f"HP {enemy['hp']}/{enemy['max_hp']}"
+    for enemy in get_active_enemies(interaction.guild_id, include_down=True):
+        state = "DOWN" if int(enemy["hp"]) <= 0 else f"HP {enemy['hp']}/{enemy['max_hp']}"
         label = f"{enemy_display_name(enemy)} — {state}"
-        if current_lower and current_lower not in label.lower():
+        if needle and needle not in label.lower():
             continue
         choices.append(app_commands.Choice(name=label[:100], value=str(enemy["id"])))
         if len(choices) >= 25:
@@ -686,14 +747,11 @@ async def player_role_autocomplete(
     guild = interaction.guild
     if guild is None:
         return []
-
     role = discord.utils.get(guild.roles, name=PLAYER_ROLE_NAME)
     if role is None:
         return []
-
     needle = current.lower().strip()
     choices: list[app_commands.Choice[str]] = []
-
     for member in role.members:
         searchable = f"{member.display_name} {member.name} {member.id}".lower()
         if needle and needle not in searchable:
@@ -706,241 +764,575 @@ async def player_role_autocomplete(
         )
         if len(choices) >= 25:
             break
-
     return choices
 
 
-
-
-
-
-
-async def perform_skill_roll(
-    interaction: discord.Interaction,
-    column: str,
-    display_name: str,
-) -> None:
+async def require_player_turn(interaction: discord.Interaction) -> Optional[sqlite3.Row]:
     if interaction.guild_id is None:
-        await interaction.response.send_message(
-            "이 명령어는 서버에서만 사용할 수 있습니다.", ephemeral=True
-        )
+        await interaction.response.send_message("이 명령어는 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return None
+    session = get_active_session(interaction.guild_id)
+    if session is None:
+        await interaction.response.send_message("진행 중인 LINKDICE 세션이 없습니다. 관리자가 `/세션`을 시작해야 합니다.", ephemeral=True)
+        return None
+    if not is_participant(int(session["id"]), interaction.user.id):
+        await interaction.response.send_message("현재 세션 참가자가 아닙니다.", ephemeral=True)
+        return None
+    if bool(session["turn_locked"]):
+        await interaction.response.send_message("현재 턴은 종료되었습니다. 정산이 끝날 때까지 기다려주세요.", ephemeral=True)
+        return None
+    existing = get_turn_action(int(session["id"]), int(session["turn_number"]), interaction.user.id)
+    if existing is not None:
+        await interaction.response.send_message("이번 턴에는 이미 행동했습니다. 필요하면 `/롤백`을 사용해주세요.", ephemeral=True)
+        return None
+    return session
+
+
+async def maybe_announce_turn_complete(guild: discord.Guild, channel: discord.abc.Messageable) -> None:
+    session = get_active_session(guild.id)
+    if session is None or bool(session["turn_locked"]):
         return
-
-    player = get_player(interaction.guild_id, interaction.user.id)
-    if player is None or player[column] is None:
-        await interaction.response.send_message(
-            f"{interaction.user.mention}님의 **{display_name}** 수치가 설정되어 있지 않습니다.\n"
-            "관리자에게 `/세팅`을 요청해주세요.",
-            ephemeral=True,
-        )
+    missing = get_missing_participants(session)
+    if missing:
         return
-
-    level = int(player[column])
-    target = LEVEL_TO_VALUE[level]
-    roll = roll_d100()
-    result, _ = judge_roll(roll, target)
-
-    embed = make_roll_embed(
-        title=display_name,
-        actor=interaction.user.display_name,
-        skill_name=display_name,
-        level=level,
-        target=target,
-        roll=roll,
-        result=result,
-        footer="LINKDICE 판정 결과입니다.",
-    )
-    await interaction.response.send_message(embed=embed)
+    lock_turn(int(session["id"]))
+    view = TurnReadyView(guild.id)
+    await channel.send("**모든 참가자가 행동했습니다. 턴이 종료되었습니다.**", view=view)
 
 
+class TimingButton(discord.ui.Button):
+    def __init__(self, game: "TimingGame") -> None:
+        super().__init__(label="누르기", style=discord.ButtonStyle.primary)
+        self.game = game
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.game.user_id:
+            await interaction.response.send_message("이 판정은 행동을 선언한 플레이어만 누를 수 있습니다.", ephemeral=True)
+            return
+        await self.game.pressed(interaction)
 
 
+class TimingView(discord.ui.View):
+    def __init__(self, game: "TimingGame") -> None:
+        super().__init__(timeout=15)
+        self.game = game
+        self.add_item(TimingButton(game))
 
 
-@bot.tree.command(name="공격", description="에너미를 대상으로 공격 판정을 합니다.")
+class TimingGame:
+    def __init__(
+        self,
+        interaction: discord.Interaction,
+        action_id: int,
+        kind: str,
+        action_name: str,
+        enemy_name: Optional[str] = None,
+        weapon_name: Optional[str] = None,
+        link_connected: bool = True,
+    ) -> None:
+        self.interaction = interaction
+        self.guild = interaction.guild
+        self.channel = interaction.channel
+        self.user_id = interaction.user.id
+        self.action_id = action_id
+        self.kind = kind
+        self.action_name = action_name
+        self.enemy_name = enemy_name
+        self.weapon_name = weapon_name
+        self.link_connected = link_connected
+        self.state = "waiting"
+        self.started_at: Optional[float] = None
+        self.finished = False
+        self.cancelled = False
+        self.task: Optional[asyncio.Task] = None
+        self.view = TimingView(self)
+
+    def thresholds(self) -> tuple[float, float]:
+        if self.kind == "defense":
+            return DEFENSE_PERFECT, DEFENSE_GOOD
+        return ATTACK_PERFECT, ATTACK_GOOD
+
+    def base_embed(self, text: str) -> discord.Embed:
+        title = self.action_name if self.kind == "custom" else ("방어" if self.kind == "defense" else "공격")
+        description = f"캐릭터 · `{self.interaction.user.display_name}`\n"
+        if self.enemy_name:
+            description += f"대상 · `{self.enemy_name}`\n"
+        description += f"\n{text}"
+        embed = discord.Embed(title=title, description=description, color=discord.Colour.blurple())
+        embed.set_footer(text="신호가 나오면 버튼을 누르세요. 너무 빠르거나 늦으면 MISS입니다.")
+        return embed
+
+    async def start(self) -> None:
+        key = (int(self.interaction.guild_id), self.user_id)
+        active_timing_games[key] = self
+        await self.interaction.response.send_message(embed=self.base_embed("타이밍을 기다리는 중..."), view=self.view)
+        self.task = asyncio.create_task(self.sequence())
+
+    async def sequence(self) -> None:
+        flavor = DEFEND_FLAVOR if self.kind == "defense" else ATTACK_FLAVOR
+        fakeouts = DEFEND_FAKEOUT if self.kind == "defense" else ATTACK_FAKEOUT
+        real_cues = DEFEND_REAL if self.kind == "defense" else ATTACK_REAL
+        try:
+            for _ in range(random.randint(1, 3)):
+                await asyncio.sleep(random.uniform(0.65, 1.35))
+                if self.finished or self.cancelled:
+                    return
+                is_fake = random.random() < 0.42
+                self.state = "fake" if is_fake else "waiting"
+                line = random.choice(fakeouts if is_fake else flavor)
+                await self.interaction.edit_original_response(embed=self.base_embed(line), view=self.view)
+            await asyncio.sleep(random.uniform(0.55, 1.15))
+            if self.finished or self.cancelled:
+                return
+            self.state = "real"
+            self.started_at = time.monotonic()
+            await self.interaction.edit_original_response(embed=self.base_embed(random.choice(real_cues)), view=self.view)
+            _, good = self.thresholds()
+            await asyncio.sleep(good + 0.45)
+            if not self.finished and not self.cancelled and self.state == "real":
+                await self.finish("MISS", None, "늦었다.")
+        except asyncio.CancelledError:
+            return
+        except discord.HTTPException:
+            if not self.finished:
+                await self.finish("MISS", None, "판정 메시지를 갱신하지 못했습니다.")
+
+    async def pressed(self, interaction: discord.Interaction) -> None:
+        if self.finished or self.cancelled:
+            await interaction.response.defer()
+            return
+        if self.state != "real" or self.started_at is None:
+            await interaction.response.defer()
+            await self.finish("MISS", None, "너무 빨랐다.")
+            return
+        elapsed = time.monotonic() - self.started_at
+        perfect, good = self.thresholds()
+        if elapsed <= perfect:
+            grade = "PERFECT"
+        elif elapsed <= good:
+            grade = "GOOD"
+        else:
+            grade = "MISS"
+        await interaction.response.defer()
+        await self.finish(grade, elapsed, None)
+
+    async def finish(self, grade: str, elapsed: Optional[float], reason: Optional[str]) -> None:
+        if self.finished or self.cancelled:
+            return
+        self.finished = True
+        if self.task and self.task is not asyncio.current_task() and not self.task.done():
+            self.task.cancel()
+        finalize_action(self.action_id, grade, elapsed)
+        key = (int(self.interaction.guild_id), self.user_id)
+        active_timing_games.pop(key, None)
+        for item in self.view.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        title = self.action_name if self.kind == "custom" else ("방어" if self.kind == "defense" else "공격")
+        lines = [f"캐릭터 · `{self.interaction.user.display_name}`"]
+        if self.enemy_name:
+            lines.append(f"대상 · `{self.enemy_name}`")
+        lines.append("")
+        lines.append(f"결과 · **{grade}**")
+        if elapsed is not None:
+            lines.append(f"반응 · `{elapsed:.2f}초`")
+        elif reason:
+            lines.append(f"판정 · {reason}")
+        embed = discord.Embed(title=title, description="\n".join(lines), color=grade_color(grade))
+        if self.kind == "attack":
+            footer = f"{self.weapon_name or FALLBACK_WEAPON_NAME}으로 공격했다!"
+            if grade != "MISS":
+                footer += " · 데미지는 /턴 종료에서 적용됩니다."
+            else:
+                footer += " · 공격이 빗나갔습니다."
+            if not self.link_connected:
+                footer += " · LINK 연결 실패로 기본 장비를 사용했습니다."
+            embed.set_footer(text=footer)
+        elif self.kind == "defense":
+            embed.set_footer(text="이 턴의 방어 판정으로 기록되었습니다.")
+        else:
+            embed.set_footer(text="이 턴의 행동으로 기록되었습니다.")
+        try:
+            await self.interaction.edit_original_response(embed=embed, view=self.view)
+        except discord.HTTPException:
+            pass
+        if self.guild is not None and self.channel is not None:
+            await maybe_announce_turn_complete(self.guild, self.channel)
+
+    async def cancel(self) -> None:
+        if self.finished or self.cancelled:
+            return
+        self.cancelled = True
+        if self.task and not self.task.done():
+            self.task.cancel()
+        key = (int(self.interaction.guild_id), self.user_id)
+        active_timing_games.pop(key, None)
+        for item in self.view.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        embed = discord.Embed(title=self.action_name, description="이 행동은 `/롤백`으로 취소되었습니다.", color=discord.Colour.light_grey())
+        try:
+            await self.interaction.edit_original_response(embed=embed, view=self.view)
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="공격", description="에너미를 대상으로 순발력 공격 판정을 합니다.")
 @app_commands.guild_only()
 @app_commands.rename(enemy="에너미")
 @app_commands.describe(enemy="공격할 에너미")
 @app_commands.autocomplete(enemy=enemy_autocomplete)
 async def attack(interaction: discord.Interaction, enemy: str) -> None:
-    if interaction.guild_id is None:
+    session = await require_player_turn(interaction)
+    if session is None or interaction.guild_id is None:
         return
-
     try:
         enemy_id = int(enemy)
     except ValueError:
-        await interaction.response.send_message(
-            "현재 등장 중인 에너미를 목록에서 선택해주세요.", ephemeral=True
-        )
+        await interaction.response.send_message("현재 등장 중인 에너미를 목록에서 선택해주세요.", ephemeral=True)
         return
-
-    target_enemy = get_enemy(interaction.guild_id, enemy_id)
-    if target_enemy is None or target_enemy["hp"] <= 0:
-        await interaction.response.send_message(
-            "그 에너미는 현재 공격할 수 없습니다.", ephemeral=True
-        )
+    target = get_enemy(interaction.guild_id, enemy_id)
+    if target is None or int(target["hp"]) <= 0:
+        await interaction.response.send_message("그 에너미는 현재 공격할 수 없습니다.", ephemeral=True)
         return
-
-    player = get_player(interaction.guild_id, interaction.user.id)
-    if player is None or player["attack"] is None:
-        await interaction.response.send_message(
-            f"{interaction.user.mention}님의 **공격** 수치가 설정되어 있지 않습니다.\n"
-            "관리자에게 `/세팅`을 요청해주세요.",
-            ephemeral=True,
+    profile, connected = await get_effective_profile(interaction.guild_id, interaction.user.id)
+    weapon = profile.get("weapon") or {"name": FALLBACK_WEAPON_NAME, "power": FALLBACK_ATTACK_POWER}
+    weapon_name = str(weapon.get("name", FALLBACK_WEAPON_NAME))
+    attack_power = max(1, int(profile.get("attack_power", FALLBACK_ATTACK_POWER)))
+    try:
+        action_id = reserve_action(
+            session,
+            interaction.user.id,
+            "attack",
+            "공격",
+            enemy_id=enemy_id,
+            attack_power=attack_power,
+            weapon_name=weapon_name,
+            link_connected=connected,
         )
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("이번 턴에는 이미 행동했습니다.", ephemeral=True)
         return
-
-    level = int(player["attack"])
-    target = LEVEL_TO_VALUE[level]
-    roll = roll_d100()
-    result, success = judge_roll(roll, target)
-
-    add_turn_action(
-        guild_id=interaction.guild_id,
-        user_id=interaction.user.id,
-        skill_name="공격",
-        skill_level=level,
-        target_value=target,
-        roll=roll,
-        result=result,
-        success=success,
-        enemy_id=enemy_id,
-        direct_attack=True,
+    game = TimingGame(
+        interaction,
+        action_id,
+        "attack",
+        "공격",
+        enemy_name=enemy_display_name(target),
+        weapon_name=weapon_name,
+        link_connected=connected,
     )
-
-    profile, _ = await get_effective_profile(interaction.guild_id, interaction.user.id)
-    weapon_name = str(profile["weapon"]["name"])
-    suffix = (
-        f"{weapon_name}으로 공격했다! · 데미지는 /턴 종료에서 확정됩니다."
-        if success
-        else f"{weapon_name}으로 공격했다! · 공격에 실패하여 데미지가 발생하지 않습니다."
-    )
-    embed = make_roll_embed(
-        title="공격",
-        actor=interaction.user.display_name,
-        target_name=enemy_display_name(target_enemy),
-        skill_name="공격",
-        level=level,
-        target=target,
-        roll=roll,
-        result=result,
-        footer=suffix,
-    )
-    await interaction.response.send_message(embed=embed)
+    await game.start()
 
 
-@bot.tree.command(name="방어", description="방어 판정을 합니다.")
+@bot.tree.command(name="방어", description="순발력 방어 판정을 합니다.")
 @app_commands.guild_only()
 async def defense(interaction: discord.Interaction) -> None:
-    await perform_skill_roll(interaction, "defense", "방어")
+    session = await require_player_turn(interaction)
+    if session is None:
+        return
+    try:
+        action_id = reserve_action(session, interaction.user.id, "defense", "방어")
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("이번 턴에는 이미 행동했습니다.", ephemeral=True)
+        return
+    game = TimingGame(interaction, action_id, "defense", "방어")
+    await game.start()
 
 
-
-
-
-
-@bot.tree.command(name="세팅", description="플레이어의 LINKDICE 판정 수치를 설정합니다.")
+@bot.tree.command(name="행동", description="임의의 행동으로 순발력 판정을 합니다.")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.rename(
-    member="유저",
-    attack_value="공격",
-    defense_value="방어",
-)
-@app_commands.describe(
-    member="설정할 유저. 생략하면 본인에게 적용됩니다.",
-    attack_value="공격 레벨 (1~5)",
-    defense_value="방어 레벨 (1~5)",
-)
-async def setup_stats(
-    interaction: discord.Interaction,
-    member: Optional[discord.Member] = None,
-    attack_value: Optional[int] = None,
-    defense_value: Optional[int] = None,
-) -> None:
-    levels = [attack_value, defense_value]
-    if any(value is not None and value not in LEVEL_TO_VALUE for value in levels):
-        await interaction.response.send_message(
-            "능력치 레벨은 **1~5** 사이여야 합니다.", ephemeral=True
-        )
+@app_commands.rename(action_name="행동이름")
+@app_commands.describe(action_name="시도할 행동의 이름 또는 설명")
+async def custom_action(interaction: discord.Interaction, action_name: str) -> None:
+    session = await require_player_turn(interaction)
+    if session is None:
         return
-    if all(value is None for value in levels):
-        await interaction.response.send_message(
-            "변경할 값을 하나 이상 입력해주세요.", ephemeral=True
-        )
+    clean_name = action_name.strip()
+    if not clean_name:
+        await interaction.response.send_message("행동 이름을 입력해주세요.", ephemeral=True)
         return
+    clean_name = clean_name[:100]
+    try:
+        action_id = reserve_action(session, interaction.user.id, "custom", clean_name)
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("이번 턴에는 이미 행동했습니다.", ephemeral=True)
+        return
+    game = TimingGame(interaction, action_id, "custom", clean_name)
+    await game.start()
 
-    fields: dict[str, object] = {}
-    changes: list[str] = []
-    for column, value, label in (
-        ("attack", attack_value, "공격"),
-        ("defense", defense_value, "방어"),
-    ):
-        if value is not None:
-            fields[column] = value
-            changes.append(f"{label}: Lv.{value} ({LEVEL_TO_VALUE[value]})")
 
-    target_member = member or interaction.user
-    update_player_fields(interaction.guild_id, target_member.id, **fields)
+@bot.tree.command(name="폭탄", description="LINK의 폭탄을 사용해 에너미에게 즉시 피해를 줍니다.")
+@app_commands.guild_only()
+@app_commands.rename(enemy="에너미")
+@app_commands.autocomplete(enemy=enemy_autocomplete)
+async def bomb_attack(interaction: discord.Interaction, enemy: str) -> None:
+    session = await require_player_turn(interaction)
+    if session is None or interaction.guild_id is None:
+        return
+    try:
+        enemy_id = int(enemy)
+    except ValueError:
+        await interaction.response.send_message("현재 등장 중인 에너미를 목록에서 선택해주세요.", ephemeral=True)
+        return
+    target = get_enemy(interaction.guild_id, enemy_id)
+    if target is None or int(target["hp"]) <= 0:
+        await interaction.response.send_message("그 에너미는 현재 공격할 수 없습니다.", ephemeral=True)
+        return
+    profile, connected = await get_effective_profile(interaction.guild_id, interaction.user.id)
+    bombs = int(profile["bombs"])
+    if bombs <= 0:
+        await interaction.response.send_message("폭탄이 없습니다.", ephemeral=True)
+        return
+    try:
+        action_id = reserve_action(
+            session,
+            interaction.user.id,
+            "bomb",
+            "폭탄",
+            enemy_id=enemy_id,
+            link_connected=connected,
+        )
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("이번 턴에는 이미 행동했습니다.", ephemeral=True)
+        return
+    damage = random.randint(BOMB_DAMAGE_MIN, BOMB_DAMAGE_MAX)
+    old_hp = int(target["hp"])
+    max_hp = int(target["max_hp"])
+    new_hp = max(0, old_hp - damage)
+    next_bombs = bombs - 1
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE active_enemies SET hp = ? WHERE guild_id = ? AND id = ?",
+            (new_hp, interaction.guild_id, enemy_id),
+        )
+        conn.commit()
+    update_player_fields(interaction.guild_id, interaction.user.id, bombs=next_bombs)
+    _, bombs_sync = get_sync_settings(interaction.guild_id)
+    synced = True
+    if bombs_sync:
+        synced = await write_link_resources(interaction.guild_id, interaction.user.id, bombs=next_bombs)
+    finalize_bomb_action(action_id, damage)
+    embed = discord.Embed(
+        title="폭탄",
+        description=(
+            f"캐릭터 · `{interaction.user.display_name}`\n"
+            f"대상 · `{enemy_display_name(target)}`\n\n"
+            f"피해 · **{damage}**\n"
+            f"에너미 체력 · {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**\n"
+            f"남은 폭탄 · **{next_bombs}**"
+            + ("\n상태 · **DOWN**" if new_hp <= 0 else "")
+        ),
+        color=discord.Colour.orange(),
+    )
+    footer = "폭탄은 즉시 적용되며 이번 턴의 행동으로 처리됩니다."
+    if bombs_sync and (not connected or not synced):
+        footer += " · LINK 폭탄 동기화 실패"
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
+    if interaction.guild is not None and interaction.channel is not None:
+        await maybe_announce_turn_complete(interaction.guild, interaction.channel)
+
+
+@bot.tree.command(name="롤백", description="현재 턴에 기록된 행동을 취소합니다.")
+@app_commands.guild_only()
+@app_commands.rename(member="유저")
+@app_commands.describe(member="관리자는 다른 참가자를 선택할 수 있습니다. 비우면 본인입니다.")
+async def rollback(interaction: discord.Interaction, member: Optional[discord.Member] = None) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    session = get_active_session(guild.id)
+    if session is None:
+        await interaction.response.send_message("진행 중인 세션이 없습니다.", ephemeral=True)
+        return
+    if bool(session["turn_locked"]):
+        await interaction.response.send_message("이미 종료된 턴은 롤백할 수 없습니다.", ephemeral=True)
+        return
+    is_admin = bool(getattr(interaction.user.guild_permissions, "administrator", False))
+    target = member or interaction.user
+    if target.id != interaction.user.id and not is_admin:
+        await interaction.response.send_message("다른 사람의 행동은 관리자만 롤백할 수 있습니다.", ephemeral=True)
+        return
+    action = get_turn_action(int(session["id"]), int(session["turn_number"]), target.id)
+    if action is None:
+        await interaction.response.send_message(f"{target.mention}님의 이번 턴 행동이 없습니다.", ephemeral=True)
+        return
+    game = active_timing_games.get((guild.id, target.id))
+    if game is not None:
+        await game.cancel()
+    rollback_note = ""
+    if action["kind"] == "bomb" and int(action["finalized"]) and int(action["bomb_damage"]) > 0:
+        enemy_id = int(action["enemy_id"])
+        enemy = get_enemy(guild.id, enemy_id)
+        if enemy is not None:
+            restored_hp = min(int(enemy["max_hp"]), int(enemy["hp"]) + int(action["bomb_damage"]))
+            with connect_db() as conn:
+                conn.execute(
+                    "UPDATE active_enemies SET hp = ? WHERE guild_id = ? AND id = ?",
+                    (restored_hp, guild.id, enemy_id),
+                )
+                conn.commit()
+        profile, connected = await get_effective_profile(guild.id, target.id)
+        restored_bombs = int(profile["bombs"]) + 1
+        update_player_fields(guild.id, target.id, bombs=restored_bombs)
+        _, bombs_sync = get_sync_settings(guild.id)
+        synced = True
+        if bombs_sync:
+            synced = await write_link_resources(guild.id, target.id, bombs=restored_bombs)
+        rollback_note = f" 폭탄 1개와 피해 {int(action['bomb_damage'])}도 되돌렸습니다."
+        if bombs_sync and (not connected or not synced):
+            rollback_note += " LINK 폭탄 동기화는 실패했습니다."
+    delete_action(int(action["id"]))
     await interaction.response.send_message(
-        f"**{target_member.display_name}** 설정 완료\n" + "\n".join(f"- {c}" for c in changes),
+        f"**{target.display_name}**님의 행동을 취소했습니다.{rollback_note}\n이번 턴에 다시 행동할 수 있습니다.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="스탯", description="LINKDICE 능력치와 LINK 장비를 확인합니다.")
+class ParticipantSelect(discord.ui.Select):
+    def __init__(self, parent_view: "SessionSetupView", members: list[discord.Member]) -> None:
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=member.display_name[:100],
+                value=str(member.id),
+                description=f"@{member.name}"[:100],
+                default=True,
+            )
+            for member in members[:25]
+        ]
+        super().__init__(
+            placeholder="세션 참가자를 선택하세요.",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent_view.admin_id:
+            await interaction.response.send_message("세션을 연 관리자만 변경할 수 있습니다.", ephemeral=True)
+            return
+        self.parent_view.selected_ids = {int(value) for value in self.values}
+        await interaction.response.defer()
+
+
+class SessionSetupView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, admin_id: int, members: list[discord.Member]) -> None:
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.admin_id = admin_id
+        self.members = members[:25]
+        self.selected_ids = {member.id for member in self.members}
+        self.add_item(ParticipantSelect(self, self.members))
+
+    @discord.ui.button(label="세션 시작", style=discord.ButtonStyle.success)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("세션을 연 관리자만 시작할 수 있습니다.", ephemeral=True)
+            return
+        if not self.selected_ids:
+            await interaction.response.send_message("참가자를 한 명 이상 선택해주세요.", ephemeral=True)
+            return
+        try:
+            session = create_session(self.guild.id, sorted(self.selected_ids))
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="세션을 시작했습니다.", view=None)
+        mentions = [f"<@{user_id}>" for user_id in get_participant_ids(int(session["id"]))]
+        embed = discord.Embed(
+            title="LINKDICE SESSION",
+            description="\n".join(mentions),
+            color=discord.Colour.blurple(),
+        )
+        embed.set_footer(text="1턴이 시작되었습니다. 각 참가자는 한 턴에 한 번만 행동할 수 있습니다.")
+        if interaction.channel is not None:
+            await interaction.channel.send(embed=embed)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("세션을 연 관리자만 취소할 수 있습니다.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="세션 시작을 취소했습니다.", view=None)
+
+
+class ActiveSessionView(discord.ui.View):
+    def __init__(self, guild_id: int, admin_id: int) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="세션 종료", style=discord.ButtonStyle.danger)
+    async def end_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        ended = end_session(self.guild_id)
+        if ended:
+            await interaction.response.edit_message(content="LINKDICE 세션을 종료했습니다.", embed=None, view=None)
+        else:
+            await interaction.response.send_message("진행 중인 세션이 없습니다.", ephemeral=True)
+
+
+@bot.tree.command(name="세션", description="TRPG 세션 참가자를 확인하고 세션을 시작하거나 상태를 확인합니다.")
 @app_commands.guild_only()
-@app_commands.rename(member="유저")
-@app_commands.describe(member="생략하면 자신의 스탯을 확인합니다.")
-async def stats(
-    interaction: discord.Interaction,
-    member: Optional[discord.Member] = None,
-) -> None:
-    if interaction.guild_id is None:
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def session_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
         return
-    target_member = member or interaction.user
-    ensure_player(interaction.guild_id, target_member.id)
-    player = get_player(interaction.guild_id, target_member.id)
-    profile, connected = await get_effective_profile(interaction.guild_id, target_member.id)
-    ring = profile.get("ring")
-    head = profile.get("head")
-    hp_sync, bombs_sync = get_sync_settings(interaction.guild_id)
-    embed = discord.Embed(title=f"{target_member.display_name} · LINKDICE")
-    embed.add_field(
-        name="판정",
-        value=(
-            f"공격 · {stat_text(player['attack'])}\n"
-            f"방어 · {stat_text(player['defense'])}"
-        ),
-        inline=False,
+    active = get_active_session(guild.id)
+    if active is not None:
+        participant_ids = get_participant_ids(int(active["id"]))
+        actions = {int(row["user_id"]): row for row in get_turn_actions(int(active["id"]), int(active["turn_number"]))}
+        lines = []
+        for user_id in participant_ids:
+            action = actions.get(user_id)
+            if action is None:
+                state = "대기"
+            elif not int(action["finalized"]):
+                state = "진행 중"
+            else:
+                grade = str(action["grade"] or "완료")
+                state = f"{action['action_name']} · {grade}"
+            lines.append(f"<@{user_id}> · **{state}**")
+        embed = discord.Embed(
+            title=f"LINKDICE SESSION · {int(active['turn_number'])}턴",
+            description="\n".join(lines),
+            color=discord.Colour.blurple(),
+        )
+        if bool(active["turn_locked"]):
+            embed.set_footer(text="현재 턴은 종료되어 정산 대기 중입니다.")
+        else:
+            embed.set_footer(text="각 참가자는 한 턴에 한 번만 행동할 수 있습니다.")
+        await interaction.response.send_message(
+            embed=embed,
+            view=ActiveSessionView(guild.id, interaction.user.id),
+            ephemeral=True,
+        )
+        return
+    role = discord.utils.get(guild.roles, name=PLAYER_ROLE_NAME)
+    if role is None:
+        await interaction.response.send_message(f"서버에 `@{PLAYER_ROLE_NAME}` 역할이 없습니다.", ephemeral=True)
+        return
+    members = [member for member in role.members if not member.bot]
+    if not members:
+        await interaction.response.send_message(f"`@{PLAYER_ROLE_NAME}` 역할을 가진 참가자가 없습니다.", ephemeral=True)
+        return
+    if len(members) > 25:
+        await interaction.response.send_message("현재 참가자 선택 UI는 한 세션에 최대 25명까지 지원합니다.", ephemeral=True)
+        return
+    names = "\n".join(f"• {member.display_name}" for member in members)
+    await interaction.response.send_message(
+        content=f"**참가자를 확인해주세요.**\n{names}",
+        view=SessionSetupView(guild, interaction.user.id, members),
+        ephemeral=True,
     )
-    embed.add_field(
-        name="LINK",
-        value=(
-            f"체력 · **{profile['hp']}/{profile['max_hp']}**\n"
-            f"공격력 · **{profile['attack_power']}**\n"
-            f"방어력 · **{profile['defense_power']}**\n"
-            f"폭탄 · **{profile['bombs']}**"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="장비",
-        value=(
-            f"무기 · `{profile['weapon']['name']}` ({profile['weapon']['power']})\n"
-            f"반지 · `{ring['name']}` (+{ring['power']})\n" if ring else f"무기 · `{profile['weapon']['name']}` ({profile['weapon']['power']})\n반지 · `없음`\n"
-        ) + (
-            f"방패 · `{profile['shield']['name']}` ({profile['shield']['power']})\n"
-            f"투구 · `{head['name']}` ({head['power']})" if head else f"방패 · `{profile['shield']['name']}` ({profile['shield']['power']})\n투구 · `없음`"
-        ),
-        inline=False,
-    )
-    source = "LINK 실시간 연결" if connected else "LINK 연결 실패 · 기본 장비/마지막 전투값 사용"
-    embed.set_footer(
-        text=f"{source} · 체력 양방향 {'ON' if hp_sync else 'OFF'} · 폭탄 양방향 {'ON' if bombs_sync else 'OFF'}"
-    )
-    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="동기화", description="LINK의 체력과 폭탄을 LINKDICE로 다시 불러옵니다.")
@@ -948,18 +1340,12 @@ async def stats(
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.rename(member="유저")
-async def sync_from_link(
-    interaction: discord.Interaction,
-    member: discord.Member,
-) -> None:
+async def sync_from_link(interaction: discord.Interaction, member: discord.Member) -> None:
     if interaction.guild_id is None:
         return
     remote = await link_api_request("GET", interaction.guild_id, member.id)
     if remote is None:
-        await interaction.response.send_message(
-            "LINK와 연결할 수 없습니다. LINK_API_URL과 LINKDICE_API_KEY를 확인해주세요.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("LINK에 연결하지 못했습니다.", ephemeral=True)
         return
     update_player_fields(
         interaction.guild_id,
@@ -978,57 +1364,41 @@ async def sync_from_link(
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-@app_commands.rename(
-    member="유저",
-    hp="체력",
-    bombs="폭탄",
-    hp_sync="체력연동",
-    bombs_sync="폭탄연동",
-)
+@app_commands.rename(member="유저", hp_sync="체력연동", bombs_sync="폭탄연동", hp_value="체력", bombs_value="폭탄")
 async def debug_sync(
     interaction: discord.Interaction,
     member: Optional[discord.Member] = None,
-    hp: Optional[int] = None,
-    bombs: Optional[int] = None,
     hp_sync: Optional[bool] = None,
     bombs_sync: Optional[bool] = None,
+    hp_value: Optional[int] = None,
+    bombs_value: Optional[int] = None,
 ) -> None:
     if interaction.guild_id is None:
         return
-    current_hp_sync, current_bombs_sync = set_sync_settings(
-        interaction.guild_id, hp_sync, bombs_sync
-    )
     target = member or interaction.user
+    next_hp_sync, next_bombs_sync = set_sync_settings(interaction.guild_id, hp_sync, bombs_sync)
     profile, connected = await get_effective_profile(interaction.guild_id, target.id)
-    if hp is not None:
-        hp = max(0, min(hp, int(profile["max_hp"])))
-        update_player_fields(
-            interaction.guild_id, target.id, hp=hp, max_hp=int(profile["max_hp"])
-        )
-        profile["hp"] = hp
-        if current_hp_sync:
-            connected = await write_link_resources(interaction.guild_id, target.id, hp=hp) and connected
-    if bombs is not None:
-        bombs = max(0, bombs)
-        update_player_fields(interaction.guild_id, target.id, bombs=bombs)
-        profile["bombs"] = bombs
-        if current_bombs_sync:
-            connected = await write_link_resources(interaction.guild_id, target.id, bombs=bombs) and connected
+    if hp_value is not None:
+        max_hp = max(int(profile["max_hp"]), 1)
+        hp_value = max(0, min(hp_value, max_hp))
+        update_player_fields(interaction.guild_id, target.id, hp=hp_value, max_hp=max_hp)
+        profile["hp"] = hp_value
+        if next_hp_sync:
+            await write_link_resources(interaction.guild_id, target.id, hp=hp_value)
+    if bombs_value is not None:
+        bombs_value = max(0, bombs_value)
+        update_player_fields(interaction.guild_id, target.id, bombs=bombs_value)
+        profile["bombs"] = bombs_value
+        if next_bombs_sync:
+            await write_link_resources(interaction.guild_id, target.id, bombs=bombs_value)
+    status = "연결됨" if connected else "연결 실패"
     await interaction.response.send_message(
-        f"**{target.display_name}** · HP {profile['hp']}/{profile['max_hp']} · 폭탄 {profile['bombs']}\n"
-        f"체력 양방향: **{'ON' if current_hp_sync else 'OFF'}** · "
-        f"폭탄 양방향: **{'ON' if current_bombs_sync else 'OFF'}**\n"
-        f"LINK 연결: **{'정상' if connected else '확인 필요'}**",
+        f"**{target.display_name} · 디버그**\n"
+        f"LINK · **{status}**\n"
+        f"체력 · **{profile['hp']}/{profile['max_hp']}** · 양방향 {'ON' if next_hp_sync else 'OFF'}\n"
+        f"폭탄 · **{profile['bombs']}** · 양방향 {'ON' if next_bombs_sync else 'OFF'}",
         ephemeral=True,
     )
-
-
-
-
-
-
-
-enemy_group = app_commands.Group(name="에너미", description="에너미를 관리합니다.")
 
 
 @bot.tree.command(name="등장", description="새 에너미를 현재 장면에 등장시킵니다.")
@@ -1036,23 +1406,13 @@ enemy_group = app_commands.Group(name="에너미", description="에너미를 관
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.rename(name="이름", hp="체력")
-@app_commands.describe(name="에너미 이름", hp="에너미 체력")
-async def enemy_spawn(
-    interaction: discord.Interaction,
-    name: str,
-    hp: int,
-) -> None:
+async def enemy_spawn(interaction: discord.Interaction, name: str, hp: int) -> None:
     if interaction.guild_id is None:
         return
-
     clean_name = name.strip()
-    if not clean_name:
-        await interaction.response.send_message("이름을 입력해주세요.", ephemeral=True)
+    if not clean_name or hp < 1:
+        await interaction.response.send_message("이름과 1 이상의 체력을 입력해주세요.", ephemeral=True)
         return
-    if hp < 1:
-        await interaction.response.send_message("체력은 1 이상이어야 합니다.", ephemeral=True)
-        return
-
     enemy_id = spawn_enemy(interaction.guild_id, clean_name, hp)
     embed = discord.Embed(
         title=f"{clean_name} #{enemy_id}",
@@ -1063,25 +1423,25 @@ async def enemy_spawn(
     await interaction.response.send_message(embed=embed)
 
 
+enemy_group = app_commands.Group(name="에너미", description="에너미를 관리합니다.")
+
+
 @enemy_group.command(name="목록", description="현재 장면의 에너미를 확인합니다.")
 @app_commands.guild_only()
 async def enemy_list(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
         return
-
     enemies = get_active_enemies(interaction.guild_id, include_down=True)
     if not enemies:
         await interaction.response.send_message("현재 등장한 에너미가 없습니다.")
         return
-
     embed = discord.Embed(title="현재 장면", color=discord.Colour.light_grey())
     for enemy in enemies:
-        if enemy["hp"] <= 0:
+        if int(enemy["hp"]) <= 0:
             value = "`DOWN`"
         else:
-            value = f"{hp_bar(enemy['hp'], enemy['max_hp'])} **{enemy['hp']}/{enemy['max_hp']}**"
+            value = f"{hp_bar(int(enemy['hp']), int(enemy['max_hp']))} **{enemy['hp']}/{enemy['max_hp']}**"
         embed.add_field(name=enemy_display_name(enemy), value=value, inline=False)
-    embed.set_footer(text="현재 등장한 에너미입니다.")
     await interaction.response.send_message(embed=embed)
 
 
@@ -1097,27 +1457,14 @@ async def enemy_remove(interaction: discord.Interaction, enemy: str) -> None:
     try:
         enemy_id = int(enemy)
     except ValueError:
-        await interaction.response.send_message(
-            "목록에서 에너미를 선택해주세요.", ephemeral=True
-        )
+        await interaction.response.send_message("목록에서 에너미를 선택해주세요.", ephemeral=True)
         return
-
     target = get_enemy(interaction.guild_id, enemy_id)
     if target is None:
-        await interaction.response.send_message(
-            "해당 에너미를 찾을 수 없습니다.", ephemeral=True
-        )
+        await interaction.response.send_message("해당 에너미를 찾을 수 없습니다.", ephemeral=True)
         return
-
     deactivate_enemy(interaction.guild_id, enemy_id)
-    await interaction.response.send_message(
-        f"**{enemy_display_name(target)}** 퇴장",
-    )
-
-
-
-
-
+    await interaction.response.send_message(f"**{enemy_display_name(target)}** 퇴장")
 
 
 player_group = app_commands.Group(name="플레이어", description="플레이어 대상 GM 명령입니다.")
@@ -1137,47 +1484,35 @@ async def player_attack(interaction: discord.Interaction, player: str) -> None:
     try:
         user_id = int(player)
     except ValueError:
-        await interaction.response.send_message(
-            f"@{PLAYER_ROLE_NAME} 역할의 플레이어를 목록에서 선택해주세요.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"@{PLAYER_ROLE_NAME} 역할의 플레이어를 목록에서 선택해주세요.", ephemeral=True)
         return
     member = guild.get_member(user_id)
     if member is None:
-        await interaction.response.send_message(
-            "해당 플레이어를 서버에서 찾을 수 없습니다.", ephemeral=True
-        )
+        await interaction.response.send_message("해당 플레이어를 서버에서 찾을 수 없습니다.", ephemeral=True)
         return
     role = discord.utils.get(guild.roles, name=PLAYER_ROLE_NAME)
-    if role is None:
-        await interaction.response.send_message(
-            f"서버에 `@{PLAYER_ROLE_NAME}` 역할이 없습니다.", ephemeral=True
-        )
-        return
-    if role not in member.roles:
-        await interaction.response.send_message(
-            f"{member.mention}님은 `@{PLAYER_ROLE_NAME}` 역할을 가지고 있지 않습니다.",
-            ephemeral=True,
-        )
+    if role is None or role not in member.roles:
+        await interaction.response.send_message(f"{member.mention}님은 `@{PLAYER_ROLE_NAME}` 역할을 가지고 있지 않습니다.", ephemeral=True)
         return
     profile, connected = await get_effective_profile(guild.id, member.id)
     old_hp = int(profile["hp"])
     max_hp = int(profile["max_hp"])
     if old_hp <= 0:
-        await interaction.response.send_message(
-            f"{member.mention}님은 이미 **DOWN** 상태입니다.", ephemeral=True
-        )
+        await interaction.response.send_message(f"{member.mention}님은 이미 **DOWN** 상태입니다.", ephemeral=True)
         return
     try:
         raw_damage, rolls, modifier = parse_and_roll_dice(DEFAULT_ENEMY_DAMAGE)
     except ValueError as exc:
-        await interaction.response.send_message(
-            f"ENEMY_DAMAGE_DICE 설정 오류: {exc}", ephemeral=True
-        )
+        await interaction.response.send_message(f"ENEMY_DAMAGE_DICE 설정 오류: {exc}", ephemeral=True)
         return
-    defense_power = max(0, int(profile["defense_power"]))
-    defense_roll = random.randint(1, defense_power) if defense_power > 0 else 0
-    damage = max(0, raw_damage - defense_roll)
+    defense_power = max(0, int(profile.get("defense_power", FALLBACK_DEFENSE_POWER)))
+    grade = "MISS"
+    session = get_active_session(guild.id)
+    if session is not None:
+        action = get_turn_action(int(session["id"]), int(session["turn_number"]), member.id)
+        if action is not None and int(action["finalized"]) and action["kind"] == "defense":
+            grade = str(action["grade"] or "MISS")
+    damage = defense_damage(raw_damage, defense_power, grade)
     new_hp = max(0, old_hp - damage)
     update_player_fields(guild.id, member.id, hp=new_hp, max_hp=max_hp)
     hp_sync, _ = get_sync_settings(guild.id)
@@ -1188,215 +1523,370 @@ async def player_attack(interaction: discord.Interaction, player: str) -> None:
         title="플레이어 공격",
         description=(
             f"대상 · `{member.display_name}`\n"
-            f"공격 · {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, raw_damage)}\n"
-            f"방어 · `1d{defense_power}` → **{defense_roll}**\n" if defense_power > 0 else
-            f"대상 · `{member.display_name}`\n"
-            f"공격 · {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, raw_damage)}\n"
-            f"방어 · **0**\n"
-        ) + (
+            f"에너미 공격 · {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, raw_damage)}\n"
+            f"방어 판정 · **{grade}**\n"
+            f"LINK 방어력 · **{defense_power}**\n\n"
             f"피해 · **{damage}**\n"
             f"체력 · {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**"
             + ("\n상태 · **DOWN**" if new_hp <= 0 else "")
         ),
         color=discord.Colour.red() if damage > 0 else discord.Colour.green(),
     )
-    footer = "에너미의 공격은 즉시 적용됩니다."
+    footer = "방어 행동이 없으면 MISS 방어로 처리됩니다."
     if hp_sync and (not connected or not synced):
         footer += " · LINK 체력 동기화 실패"
     embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="폭탄", description="LINK의 폭탄을 사용해 에너미에게 즉시 피해를 줍니다.")
-@app_commands.guild_only()
-@app_commands.rename(enemy="에너미")
-@app_commands.autocomplete(enemy=enemy_autocomplete)
-async def bomb_attack(interaction: discord.Interaction, enemy: str) -> None:
-    if interaction.guild_id is None:
-        return
-    try:
-        enemy_id = int(enemy)
-    except ValueError:
-        await interaction.response.send_message(
-            "현재 등장 중인 에너미를 목록에서 선택해주세요.", ephemeral=True
+class TurnReadyView(discord.ui.View):
+    def __init__(self, guild_id: int) -> None:
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="턴 정산", style=discord.ButtonStyle.success)
+    async def resolve_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not getattr(interaction.user.guild_permissions, "administrator", False):
+            await interaction.response.send_message("관리자만 턴을 정산할 수 있습니다.", ephemeral=True)
+            return
+        await begin_turn_resolution(interaction)
+
+
+class MissingTurnConfirmView(discord.ui.View):
+    def __init__(self, admin_id: int) -> None:
+        super().__init__(timeout=180)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="진행", style=discord.ButtonStyle.danger)
+    async def proceed(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("`/턴 종료`를 실행한 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="미행동자를 제외하고 턴을 정산합니다.", view=None)
+        await begin_turn_resolution(interaction, response_already_used=True)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("`/턴 종료`를 실행한 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="턴 종료를 취소했습니다.", view=None)
+
+
+class CustomResolutionFlow:
+    def __init__(self, guild: discord.Guild, admin_id: int, session_id: int, turn_number: int, actions: list[sqlite3.Row]) -> None:
+        self.guild = guild
+        self.admin_id = admin_id
+        self.session_id = session_id
+        self.turn_number = turn_number
+        self.actions = actions
+        self.index = 0
+
+    @property
+    def current(self) -> sqlite3.Row:
+        return self.actions[self.index]
+
+    def prompt(self) -> str:
+        action = self.current
+        return (
+            f"**행동 공격 여부 {self.index + 1}/{len(self.actions)}**\n"
+            f"{member_label(self.guild, int(action['user_id']))} · `{action['action_name']}` · **{action['grade']}**\n"
+            "이 행동을 공격으로 처리합니까?"
         )
-        return
-    target_enemy = get_enemy(interaction.guild_id, enemy_id)
-    if target_enemy is None or target_enemy["hp"] <= 0:
-        await interaction.response.send_message(
-            "그 에너미는 현재 공격할 수 없습니다.", ephemeral=True
+
+    async def send_current(self, interaction: discord.Interaction, edit: bool = False) -> None:
+        view = CustomAttackDecisionView(self, int(self.current["id"]))
+        if edit:
+            await interaction.response.edit_message(content=self.prompt(), view=view)
+        elif interaction.response.is_done():
+            await interaction.followup.send(self.prompt(), view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(self.prompt(), view=view, ephemeral=True)
+
+    async def next(self, interaction: discord.Interaction, edit: bool = False) -> None:
+        self.index += 1
+        if self.index >= len(self.actions):
+            if edit:
+                await interaction.response.edit_message(content="행동 판정 입력 완료. 데미지를 정산합니다.", view=None)
+            elif interaction.response.is_done():
+                await interaction.followup.send("행동 판정 입력 완료. 데미지를 정산합니다.", ephemeral=True)
+            else:
+                await interaction.response.send_message("행동 판정 입력 완료. 데미지를 정산합니다.", ephemeral=True)
+            if interaction.channel is not None:
+                await resolve_and_advance_turn(self.guild, interaction.channel, self.session_id, self.turn_number)
+            return
+        await self.send_current(interaction, edit=edit)
+
+
+class CustomAttackDecisionView(discord.ui.View):
+    def __init__(self, flow: CustomResolutionFlow, action_id: int) -> None:
+        super().__init__(timeout=300)
+        self.flow = flow
+        self.action_id = action_id
+
+    def valid(self) -> bool:
+        return self.flow.index < len(self.flow.actions) and int(self.flow.current["id"]) == self.action_id
+
+    @discord.ui.button(label="공격으로 처리", style=discord.ButtonStyle.danger)
+    async def as_attack(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        if not self.valid():
+            await interaction.response.send_message("이미 처리된 행동입니다.", ephemeral=True)
+            return
+        enemies = get_active_enemies(self.flow.guild.id, include_down=False)
+        if not enemies:
+            await interaction.response.send_message("공격할 수 있는 에너미가 없습니다.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content=(
+                f"**{member_label(self.flow.guild, int(self.flow.current['user_id']))} · {self.flow.current['action_name']}**\n"
+                "공격 대상을 선택한 뒤 공격 수치를 입력하세요."
+            ),
+            view=CustomAttackTargetView(self.flow, self.action_id, enemies),
         )
+
+    @discord.ui.button(label="공격 아님", style=discord.ButtonStyle.secondary)
+    async def not_attack(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        if not self.valid():
+            await interaction.response.send_message("이미 처리된 행동입니다.", ephemeral=True)
+            return
+        set_custom_action_resolution(self.action_id, False)
+        await self.flow.next(interaction, edit=True)
+
+
+class CustomEnemySelect(discord.ui.Select):
+    def __init__(self, parent_view: "CustomAttackTargetView", enemies: list[sqlite3.Row]) -> None:
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=enemy_display_name(enemy)[:100],
+                value=str(enemy["id"]),
+                description=f"HP {enemy['hp']}/{enemy['max_hp']}"[:100],
+            )
+            for enemy in enemies[:25]
+        ]
+        super().__init__(placeholder="공격 대상", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent_view.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        self.parent_view.enemy_id = int(self.values[0])
+        await interaction.response.defer()
+
+
+class CustomAttackTargetView(discord.ui.View):
+    def __init__(self, flow: CustomResolutionFlow, action_id: int, enemies: list[sqlite3.Row]) -> None:
+        super().__init__(timeout=300)
+        self.flow = flow
+        self.action_id = action_id
+        self.enemy_id: Optional[int] = None
+        self.add_item(CustomEnemySelect(self, enemies))
+
+    @discord.ui.button(label="공격 수치 입력", style=discord.ButtonStyle.success)
+    async def power_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        if self.enemy_id is None:
+            await interaction.response.send_message("먼저 에너미를 선택해주세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CustomAttackPowerModal(self.flow, self.action_id, self.enemy_id))
+
+    @discord.ui.button(label="뒤로", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content=self.flow.prompt(), view=CustomAttackDecisionView(self.flow, self.action_id))
+
+
+class CustomAttackPowerModal(discord.ui.Modal):
+    def __init__(self, flow: CustomResolutionFlow, action_id: int, enemy_id: int) -> None:
+        super().__init__(title="공격 수치 입력")
+        self.flow = flow
+        self.action_id = action_id
+        self.enemy_id = enemy_id
+        self.power = discord.ui.TextInput(label="공격 수치", placeholder="예: 8", required=True, max_length=4)
+        self.add_item(self.power)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.flow.admin_id:
+            await interaction.response.send_message("턴을 정산하는 관리자만 입력할 수 있습니다.", ephemeral=True)
+            return
+        try:
+            value = int(str(self.power.value).strip())
+        except ValueError:
+            await interaction.response.send_message("공격 수치는 정수로 입력해주세요.", ephemeral=True)
+            return
+        if value < 1 or value > 9999:
+            await interaction.response.send_message("공격 수치는 1~9999 사이로 입력해주세요.", ephemeral=True)
+            return
+        set_custom_action_resolution(self.action_id, True, self.enemy_id, value)
+        await interaction.response.send_message("공격 수치를 기록했습니다.", ephemeral=True)
+        await self.flow.next(interaction, edit=False)
+
+
+async def begin_turn_resolution(interaction: discord.Interaction, response_already_used: bool = False) -> None:
+    guild = interaction.guild
+    if guild is None:
         return
-    profile, connected = await get_effective_profile(interaction.guild_id, interaction.user.id)
-    bombs = int(profile["bombs"])
-    if bombs <= 0:
-        await interaction.response.send_message("폭탄이 없습니다.", ephemeral=True)
+    session = get_active_session(guild.id)
+    if session is None:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("진행 중인 세션이 없습니다.", ephemeral=True)
+        else:
+            await interaction.followup.send("진행 중인 세션이 없습니다.", ephemeral=True)
         return
-    damage = random.randint(BOMB_DAMAGE_MIN, BOMB_DAMAGE_MAX)
-    next_bombs = bombs - 1
-    old_hp = int(target_enemy["hp"])
-    max_hp = int(target_enemy["max_hp"])
-    new_hp = max(0, old_hp - damage)
-    with connect_db() as conn:
-        conn.execute(
-            "UPDATE active_enemies SET hp = ? WHERE guild_id = ? AND id = ?",
-            (new_hp, interaction.guild_id, enemy_id),
-        )
-        conn.commit()
-    update_player_fields(interaction.guild_id, interaction.user.id, bombs=next_bombs)
-    _, bombs_sync = get_sync_settings(interaction.guild_id)
-    synced = True
-    if bombs_sync:
-        synced = await write_link_resources(
-            interaction.guild_id, interaction.user.id, bombs=next_bombs
-        )
-    embed = discord.Embed(
-        title="폭탄",
-        description=(
-            f"캐릭터 · `{interaction.user.display_name}`\n"
-            f"대상 · `{enemy_display_name(target_enemy)}`\n"
-            f"피해 · **{damage}**\n"
-            f"에너미 체력 · {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**\n"
-            f"남은 폭탄 · **{next_bombs}**"
-            + ("\n상태 · **DOWN**" if new_hp <= 0 else "")
-        ),
-        color=discord.Colour.orange(),
-    )
-    footer = "폭탄 피해는 즉시 적용됩니다."
-    if bombs_sync and (not connected or not synced):
-        footer += " · LINK 폭탄 동기화 실패"
-    embed.set_footer(text=footer)
-    await interaction.response.send_message(embed=embed)
+    if bool(session["resolving"]):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("이미 턴 정산이 진행 중입니다.", ephemeral=True)
+        else:
+            await interaction.followup.send("이미 턴 정산이 진행 중입니다.", ephemeral=True)
+        return
+    set_resolving(int(session["id"]), True)
+    actions = get_turn_actions(int(session["id"]), int(session["turn_number"]))
+    optional = [
+        action
+        for action in actions
+        if action["kind"] == "custom"
+        and int(action["finalized"])
+        and str(action["grade"]) in ("PERFECT", "GOOD")
+        and action["custom_attack"] is None
+    ]
+    if optional:
+        flow = CustomResolutionFlow(guild, interaction.user.id, int(session["id"]), int(session["turn_number"]), optional)
+        await flow.send_current(interaction, edit=False)
+        return
+    if not interaction.response.is_done():
+        await interaction.response.send_message("턴을 정산합니다.", ephemeral=True)
+    elif not response_already_used:
+        await interaction.followup.send("턴을 정산합니다.", ephemeral=True)
+    if interaction.channel is not None:
+        await resolve_and_advance_turn(guild, interaction.channel, int(session["id"]), int(session["turn_number"]))
 
 
-
-
-
-
-
-async def resolve_turn(
+async def resolve_and_advance_turn(
     guild: discord.Guild,
     channel: discord.abc.Messageable,
-) -> str:
-    actions = get_pending_actions(guild.id)
-    if not actions:
-        return "이번 턴에 처리할 판정이 없습니다."
-
+    session_id: int,
+    turn_number: int,
+) -> None:
+    actions = get_turn_actions(session_id, turn_number)
     damage_entries: list[dict[str, object]] = []
-    enemy_totals: defaultdict[int, int] = defaultdict(int)
+    enemy_totals: dict[int, int] = {}
     skipped: list[str] = []
 
     for action in actions:
-        if not action["success"] or not action["counts_as_attack"]:
+        if not int(action["finalized"]):
             continue
-        if action["enemy_id"] is None:
-            skipped.append(
-                f"{member_label(guild, action['user_id'])} — {action['skill_name']}: 대상 없음"
+        kind = str(action["kind"])
+        grade = str(action["grade"] or "MISS")
+        if kind == "attack":
+            if grade == "MISS":
+                continue
+            if action["enemy_id"] is None or action["attack_power"] is None:
+                skipped.append(f"{member_label(guild, int(action['user_id']))} · 공격 대상/공격력 없음")
+                continue
+            enemy_id = int(action["enemy_id"])
+            enemy = get_enemy(guild.id, enemy_id)
+            if enemy is None:
+                skipped.append(f"{member_label(guild, int(action['user_id']))} · 대상 에너미 없음")
+                continue
+            power = int(action["attack_power"])
+            damage = grade_damage(power, grade)
+            enemy_totals[enemy_id] = enemy_totals.get(enemy_id, 0) + damage
+            damage_entries.append(
+                {
+                    "user_id": int(action["user_id"]),
+                    "label": str(action["weapon_name"] or FALLBACK_WEAPON_NAME),
+                    "grade": grade,
+                    "power": power,
+                    "damage": damage,
+                    "enemy_id": enemy_id,
+                    "enemy_name": enemy_display_name(enemy),
+                }
             )
-            continue
-
-        enemy = get_enemy(guild.id, int(action["enemy_id"]))
-        if enemy is None:
-            skipped.append(
-                f"{member_label(guild, action['user_id'])} — {action['skill_name']}: 에너미 없음"
+        elif kind == "custom" and int(action["custom_attack"] or 0):
+            if grade == "MISS" or action["custom_enemy_id"] is None or action["custom_attack_power"] is None:
+                continue
+            enemy_id = int(action["custom_enemy_id"])
+            enemy = get_enemy(guild.id, enemy_id)
+            if enemy is None:
+                skipped.append(f"{member_label(guild, int(action['user_id']))} · `{action['action_name']}` 대상 에너미 없음")
+                continue
+            power = int(action["custom_attack_power"])
+            damage = grade_damage(power, grade)
+            enemy_totals[enemy_id] = enemy_totals.get(enemy_id, 0) + damage
+            damage_entries.append(
+                {
+                    "user_id": int(action["user_id"]),
+                    "label": str(action["action_name"]),
+                    "grade": grade,
+                    "power": power,
+                    "damage": damage,
+                    "enemy_id": enemy_id,
+                    "enemy_name": enemy_display_name(enemy),
+                }
             )
-            continue
-
-        profile, connected = await get_effective_profile(guild.id, int(action["user_id"]))
-        attack_power_value = max(0, int(profile["attack_power"]))
-        expression = damage_expression_for_attack_power(attack_power_value)
-        try:
-            damage, rolls, modifier = parse_and_roll_dice(expression)
-        except ValueError as exc:
-            skipped.append(
-                f"{member_label(guild, action['user_id'])} — 데미지식 오류: {exc}"
-            )
-            continue
-
-        enemy_id = int(enemy["id"])
-        enemy_totals[enemy_id] += damage
-        damage_entries.append(
-            {
-                "user_id": int(action["user_id"]),
-                "skill_name": str(action["skill_name"]),
-                "enemy_id": enemy_id,
-                "enemy_name": enemy_display_name(enemy),
-                "expression": expression,
-                "rolls": rolls,
-                "modifier": modifier,
-                "damage": damage,
-                "attack_power": attack_power_value,
-                "weapon_name": profile["weapon"]["name"],
-            }
-        )
 
     enemy_summaries: list[str] = []
     with connect_db() as conn:
         for enemy_id, total_damage in enemy_totals.items():
             enemy = conn.execute(
-                """
-                SELECT * FROM active_enemies
-                WHERE guild_id = ? AND id = ? AND active = 1
-                """,
+                "SELECT * FROM active_enemies WHERE guild_id = ? AND id = ? AND active = 1",
                 (guild.id, enemy_id),
             ).fetchone()
             if enemy is None:
                 continue
-
             old_hp = int(enemy["hp"])
             max_hp = int(enemy["max_hp"])
             new_hp = max(0, old_hp - total_damage)
             conn.execute(
-                "UPDATE active_enemies SET hp = ? WHERE id = ? AND guild_id = ?",
-                (new_hp, enemy_id, guild.id),
+                "UPDATE active_enemies SET hp = ? WHERE guild_id = ? AND id = ?",
+                (new_hp, guild.id, enemy_id),
             )
-
-            state = " — **DOWN**" if new_hp <= 0 else ""
             enemy_summaries.append(
                 f"**{enemy_display_name(enemy)}**\n"
-                f"HP {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}** "
-                f"(총 -{total_damage}){state}"
+                f"{hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}** · 총 **-{total_damage}**"
+                + (" · **DOWN**" if new_hp <= 0 else "")
             )
-
-        conn.execute(
-            """
-            UPDATE turn_actions
-            SET resolved = 1
-            WHERE guild_id = ? AND resolved = 0
-            """,
-            (guild.id,),
-        )
         conn.commit()
 
-    embed = discord.Embed(title="턴 결과", color=discord.Colour.blurple())
+    mark_turn_actions_resolved(session_id, turn_number)
+    next_turn = advance_turn(session_id)
+
+    embed = discord.Embed(title=f"{turn_number}턴 결과", color=discord.Colour.blurple())
     if damage_entries:
         for entry in damage_entries:
+            multiplier = "× 1.4" if entry["grade"] == "PERFECT" else "× 1.0"
             embed.add_field(
-                name=f"{member_label(guild, entry['user_id'])} → {entry['enemy_name']}",
+                name=f"{member_label(guild, int(entry['user_id']))} → {entry['enemy_name']}",
                 value=(
-                    f"판정 · `{entry['skill_name']}`\n"
-                    f"무기 · `{entry['weapon_name']}` · 공격력 **{entry['attack_power']}**\n"
-                    f"데미지 · {format_dice_roll(entry['expression'], entry['rolls'], entry['modifier'], entry['damage'])}"
+                    f"`{entry['label']}` · **{entry['grade']}**\n"
+                    f"공격 {entry['power']} {multiplier} → **{entry['damage']} DAMAGE**"
                 ),
                 inline=False,
             )
     else:
-        embed.description = "이번 턴에 적용되는 데미지가 없습니다."
+        embed.description = "이번 턴에 정산할 공격 데미지가 없습니다."
     for summary in enemy_summaries:
         embed.add_field(name="\u200b", value=summary, inline=False)
-    footer_parts = []
     if skipped:
-        footer_parts.append("처리 제외: " + " / ".join(skipped))
-    footer_parts.append("턴의 공격 데미지가 확정되었습니다.")
-    embed.set_footer(text=" · ".join(footer_parts)[:2048])
+        embed.add_field(name="처리 제외", value="\n".join(f"• {item}" for item in skipped)[:1024], inline=False)
+    embed.set_footer(text=f"{next_turn}턴이 시작되었습니다.")
     await channel.send(embed=embed)
-    return "턴 종료 처리 완료."
 
 
 turn_group = app_commands.Group(name="턴", description="턴을 관리합니다.")
 
 
-@turn_group.command(name="종료", description="현재 턴의 공격 데미지를 확정하고 적용합니다.")
+@turn_group.command(name="종료", description="현재 턴을 종료하고 공격 데미지를 정산합니다.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1404,21 +1894,23 @@ async def turn_end(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None:
         return
-
-    actions = get_pending_actions(guild.id)
-    if not actions:
+    session = get_active_session(guild.id)
+    if session is None:
+        await interaction.response.send_message("진행 중인 세션이 없습니다.", ephemeral=True)
+        return
+    if bool(session["resolving"]):
+        await interaction.response.send_message("이미 턴 정산이 진행 중입니다.", ephemeral=True)
+        return
+    missing = get_missing_participants(session)
+    if missing:
+        mentions = ", ".join(f"<@{user_id}>" for user_id in missing)
         await interaction.response.send_message(
-            "이번 턴에 처리할 공격 판정이 없습니다.", ephemeral=True
+            f"{mentions} 님이 아직 행동하지 않았습니다.\n**이대로 진행하시겠습니까?**",
+            view=MissingTurnConfirmView(interaction.user.id),
+            ephemeral=True,
         )
         return
-
-    await interaction.response.defer(ephemeral=True)
-    await resolve_turn(guild, interaction.channel)
-    await interaction.followup.send("턴 종료 처리 완료.", ephemeral=True)
-
-
-
-
+    await begin_turn_resolution(interaction)
 
 
 @bot.tree.error
@@ -1433,16 +1925,10 @@ async def on_app_command_error(
     else:
         print(f"Command error: {error!r}")
         message = "명령어 처리 중 오류가 발생했습니다. 콘솔 로그를 확인해주세요."
-
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
     else:
         await interaction.response.send_message(message, ephemeral=True)
-
-
-
-
-
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
