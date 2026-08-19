@@ -601,20 +601,21 @@ class LinkDiceBot(commands.Bot):
     async def setup_hook(self) -> None:
         init_db()
 
-        
         self.tree.add_command(enemy_group)
         self.tree.add_command(player_group)
         self.tree.add_command(turn_group)
 
+        synced_global = await self.tree.sync()
+        print(f"Global commands synced: {len(synced_global)}")
+
         test_guild_id = os.getenv("TEST_GUILD_ID")
         if test_guild_id:
             guild = discord.Object(id=int(test_guild_id))
-            self.tree.copy_global_to(guild=guild)
+            self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
-            print(f"Commands synced to test guild {test_guild_id}")
-        else:
-            await self.tree.sync()
-            print("Global commands synced")
+            self.tree.copy_global_to(guild=guild)
+            synced_guild = await self.tree.sync(guild=guild)
+            print(f"Fresh guild commands synced to {test_guild_id}: {len(synced_guild)}")
 
 
 bot = LinkDiceBot()
@@ -622,6 +623,7 @@ bot = LinkDiceBot()
 
 @bot.event
 async def on_ready() -> None:
+    print("LINKDICE BUILD: setup-self-fix-20260819")
     print(f"Logged in as {bot.user}")
     print(f"Database: {DB_PATH}")
 
@@ -806,10 +808,12 @@ async def attack(interaction: discord.Interaction, enemy: str) -> None:
         direct_attack=True,
     )
 
+    profile, _ = await get_effective_profile(interaction.guild_id, interaction.user.id)
+    weapon_name = str(profile["weapon"]["name"])
     suffix = (
-        "데미지는 /턴 종료에서 확정됩니다."
+        f"{weapon_name}으로 공격했다! · 데미지는 /턴 종료에서 확정됩니다."
         if success
-        else "공격에 실패하여 데미지가 발생하지 않습니다."
+        else f"{weapon_name}으로 공격했다! · 공격에 실패하여 데미지가 발생하지 않습니다."
     )
     embed = make_roll_embed(
         title="공격",
@@ -845,13 +849,13 @@ async def defense(interaction: discord.Interaction) -> None:
     defense_value="방어",
 )
 @app_commands.describe(
-    member="설정할 유저",
+    member="설정할 유저. 생략하면 본인에게 적용됩니다.",
     attack_value="공격 레벨 (1~5)",
     defense_value="방어 레벨 (1~5)",
 )
 async def setup_stats(
     interaction: discord.Interaction,
-    member: discord.Member,
+    member: Optional[discord.Member] = None,
     attack_value: Optional[int] = None,
     defense_value: Optional[int] = None,
 ) -> None:
@@ -877,9 +881,10 @@ async def setup_stats(
             fields[column] = value
             changes.append(f"{label}: Lv.{value} ({LEVEL_TO_VALUE[value]})")
 
-    update_player_fields(interaction.guild_id, member.id, **fields)
+    target_member = member or interaction.user
+    update_player_fields(interaction.guild_id, target_member.id, **fields)
     await interaction.response.send_message(
-        f"**{member.display_name}** 설정 완료\n" + "\n".join(f"- {c}" for c in changes),
+        f"**{target_member.display_name}** 설정 완료\n" + "\n".join(f"- {c}" for c in changes),
         ephemeral=True,
     )
 
