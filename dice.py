@@ -695,6 +695,7 @@ class LinkDiceBot(commands.Bot):
 
 bot = LinkDiceBot()
 active_timing_games: dict[tuple[int, int], "TimingGame"] = {}
+active_session_lobbies: dict[int, "SessionSetupView"] = {}
 
 
 @bot.event
@@ -959,7 +960,7 @@ class TimingGame:
         if self.guild is not None and self.channel is not None:
             await maybe_announce_turn_complete(self.guild, self.channel)
 
-    async def cancel(self) -> None:
+    async def cancel(self, reason: str = "이 행동은 `/롤백`으로 취소되었습니다.") -> None:
         if self.finished or self.cancelled:
             return
         self.cancelled = True
@@ -970,7 +971,7 @@ class TimingGame:
         for item in self.view.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
-        embed = discord.Embed(title=self.action_name, description="이 행동은 `/롤백`으로 취소되었습니다.", color=discord.Colour.light_grey())
+        embed = discord.Embed(title=self.action_name, description=reason, color=discord.Colour.light_grey())
         try:
             await self.interaction.edit_original_response(embed=embed, view=self.view)
         except discord.HTTPException:
@@ -1190,74 +1191,154 @@ async def rollback(interaction: discord.Interaction, member: Optional[discord.Me
     )
 
 
-class ParticipantSelect(discord.ui.Select):
-    def __init__(self, parent_view: "SessionSetupView", members: list[discord.Member]) -> None:
-        self.parent_view = parent_view
-        options = [
-            discord.SelectOption(
-                label=member.display_name[:100],
-                value=str(member.id),
-                description=f"@{member.name}"[:100],
-                default=True,
-            )
-            for member in members[:25]
-        ]
-        super().__init__(
-            placeholder="세션 참가자를 선택하세요.",
-            min_values=1,
-            max_values=len(options),
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.parent_view.admin_id:
-            await interaction.response.send_message("세션을 연 관리자만 변경할 수 있습니다.", ephemeral=True)
-            return
-        self.parent_view.selected_ids = {int(value) for value in self.values}
-        await interaction.response.defer()
-
-
 class SessionSetupView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, admin_id: int, members: list[discord.Member]) -> None:
-        super().__init__(timeout=300)
+    def __init__(self, guild: discord.Guild, admin_id: int, explorers: list[discord.Member]) -> None:
+        super().__init__(timeout=600)
         self.guild = guild
         self.admin_id = admin_id
-        self.members = members[:25]
-        self.selected_ids = {member.id for member in self.members}
-        self.add_item(ParticipantSelect(self, self.members))
+        self.explorers = explorers[:25]
+        self.explorer_ids = {member.id for member in self.explorers}
+        self.checked_ids: set[int] = set()
+        self.message: Optional[discord.Message] = None
+        self.refresh_buttons()
 
-    @discord.ui.button(label="세션 시작", style=discord.ButtonStyle.success)
-    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message("세션을 연 관리자만 시작할 수 있습니다.", ephemeral=True)
+    def is_ready(self) -> bool:
+        return bool(self.explorer_ids) and self.explorer_ids.issubset(self.checked_ids)
+
+    def participant_ids(self) -> list[int]:
+        selected = set(self.explorer_ids)
+        if self.admin_id in self.checked_ids:
+            selected.add(self.admin_id)
+        return sorted(selected)
+
+    def build_embed(self) -> discord.Embed:
+        lines: list[str] = []
+        for member in self.explorers:
+            checked = member.id in self.checked_ids
+            mark = "☑" if checked else "☐"
+            suffix = " · 관리자" if member.id == self.admin_id else ""
+            lines.append(f"{mark} <@{member.id}>{suffix}")
+        if self.admin_id not in self.explorer_ids:
+            admin_checked = self.admin_id in self.checked_ids
+            mark = "☑" if admin_checked else "☐"
+            lines.append(f"{mark} <@{self.admin_id}> · 관리자 선택 참가")
+        ready_mark = "☑" if self.is_ready() else "☐"
+        embed = discord.Embed(
+            title="LINKDICE SESSION · 참가 확인",
+            description="\n".join(lines),
+            color=discord.Colour.green() if self.is_ready() else discord.Colour.blurple(),
+        )
+        if self.is_ready():
+            embed.add_field(name="출발", value=f"{ready_mark} 탐사자 전원의 참가 확인이 완료되었습니다.", inline=False)
+            embed.set_footer(text="관리자가 출발 버튼을 누르면 1턴이 시작됩니다.")
+        else:
+            embed.add_field(name="출발", value=f"{ready_mark} 아직 참가 확인을 기다리는 중입니다.", inline=False)
+            embed.set_footer(text="각 탐사자는 참가 체크 버튼을 눌러주세요. 관리자는 선택적으로 참가할 수 있습니다.")
+        return embed
+
+    def refresh_buttons(self) -> None:
+        ready = self.is_ready()
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.custom_id == "linkdice_session_depart":
+                item.label = "출발 ☑" if ready else "출발 ☐"
+                item.style = discord.ButtonStyle.success if ready else discord.ButtonStyle.secondary
+                item.disabled = not ready
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        self.refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="참가 체크", style=discord.ButtonStyle.primary, custom_id="linkdice_session_check")
+    async def check_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        user_id = interaction.user.id
+        allowed = user_id in self.explorer_ids or user_id == self.admin_id
+        if not allowed:
+            await interaction.response.send_message("이번 세션의 참가 확인 대상이 아닙니다.", ephemeral=True)
             return
-        if not self.selected_ids:
-            await interaction.response.send_message("참가자를 한 명 이상 선택해주세요.", ephemeral=True)
+        if user_id in self.checked_ids:
+            self.checked_ids.remove(user_id)
+        else:
+            self.checked_ids.add(user_id)
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="출발 ☐", style=discord.ButtonStyle.secondary, disabled=True, custom_id="linkdice_session_depart")
+    async def depart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("세션을 연 관리자만 출발할 수 있습니다.", ephemeral=True)
+            return
+        if not self.is_ready():
+            await interaction.response.send_message("아직 참가 확인을 완료하지 않은 탐사자가 있습니다.", ephemeral=True)
             return
         try:
-            session = create_session(self.guild.id, sorted(self.selected_ids))
+            session = create_session(self.guild.id, self.participant_ids())
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
         self.stop()
-        await interaction.response.edit_message(content="세션을 시작했습니다.", view=None)
+        active_session_lobbies.pop(self.guild.id, None)
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        await interaction.response.edit_message(content="**출발했습니다.**", embed=self.build_embed(), view=self)
         mentions = [f"<@{user_id}>" for user_id in get_participant_ids(int(session["id"]))]
         embed = discord.Embed(
-            title="LINKDICE SESSION",
-            description="\n".join(mentions),
+            title="LINKDICE SESSION · 1턴",
+            description="\n".join(f"{mention} · **대기**" for mention in mentions),
             color=discord.Colour.blurple(),
         )
         embed.set_footer(text="1턴이 시작되었습니다. 각 참가자는 한 턴에 한 번만 행동할 수 있습니다.")
         if interaction.channel is not None:
             await interaction.channel.send(embed=embed)
 
-    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, custom_id="linkdice_session_cancel")
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.admin_id:
             await interaction.response.send_message("세션을 연 관리자만 취소할 수 있습니다.", ephemeral=True)
             return
         self.stop()
-        await interaction.response.edit_message(content="세션 시작을 취소했습니다.", view=None)
+        active_session_lobbies.pop(self.guild.id, None)
+        await interaction.response.edit_message(content="세션 준비를 취소했습니다.", embed=None, view=None)
+
+    async def on_timeout(self) -> None:
+        active_session_lobbies.pop(self.guild.id, None)
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(content="세션 참가 확인 시간이 만료되었습니다.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+class SessionEndConfirmView(discord.ui.View):
+    def __init__(self, guild_id: int, admin_id: int) -> None:
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="세션 종료", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("이 확인은 명령어를 실행한 관리자만 할 수 있습니다.", ephemeral=True)
+            return
+        ended = end_session(self.guild_id)
+        for key, game in list(active_timing_games.items()):
+            if key[0] == self.guild_id:
+                await game.cancel("세션 종료로 이 행동이 취소되었습니다.")
+        self.stop()
+        if ended:
+            await interaction.response.edit_message(content="LINKDICE 세션을 종료했습니다.", view=None)
+        else:
+            await interaction.response.edit_message(content="진행 중인 세션이 없습니다.", view=None)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("이 확인은 명령어를 실행한 관리자만 할 수 있습니다.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="세션 종료를 취소했습니다.", view=None)
 
 
 class ActiveSessionView(discord.ui.View):
@@ -1268,17 +1349,17 @@ class ActiveSessionView(discord.ui.View):
 
     @discord.ui.button(label="세션 종료", style=discord.ButtonStyle.danger)
     async def end_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.user.id != self.admin_id:
+        if not bool(getattr(interaction.user.guild_permissions, "administrator", False)):
             await interaction.response.send_message("이 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
-        ended = end_session(self.guild_id)
-        if ended:
-            await interaction.response.edit_message(content="LINKDICE 세션을 종료했습니다.", embed=None, view=None)
-        else:
-            await interaction.response.send_message("진행 중인 세션이 없습니다.", ephemeral=True)
+        await interaction.response.send_message(
+            "현재 LINKDICE 세션을 종료하시겠습니까?",
+            view=SessionEndConfirmView(self.guild_id, interaction.user.id),
+            ephemeral=True,
+        )
 
 
-@bot.tree.command(name="세션", description="TRPG 세션 참가자를 확인하고 세션을 시작하거나 상태를 확인합니다.")
+@bot.tree.command(name="세션", description="TRPG 세션 참가 확인을 열거나 현재 세션 상태를 확인합니다.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1316,6 +1397,10 @@ async def session_command(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+    lobby = active_session_lobbies.get(guild.id)
+    if lobby is not None:
+        await interaction.response.send_message("이미 참가 확인이 진행 중입니다. 기존 `/세션` 메시지를 사용해주세요.", ephemeral=True)
+        return
     role = discord.utils.get(guild.roles, name=PLAYER_ROLE_NAME)
     if role is None:
         await interaction.response.send_message(f"서버에 `@{PLAYER_ROLE_NAME}` 역할이 없습니다.", ephemeral=True)
@@ -1325,12 +1410,46 @@ async def session_command(interaction: discord.Interaction) -> None:
         await interaction.response.send_message(f"`@{PLAYER_ROLE_NAME}` 역할을 가진 참가자가 없습니다.", ephemeral=True)
         return
     if len(members) > 25:
-        await interaction.response.send_message("현재 참가자 선택 UI는 한 세션에 최대 25명까지 지원합니다.", ephemeral=True)
+        await interaction.response.send_message("현재 참가 확인 UI는 한 세션에 최대 25명의 탐사자를 지원합니다.", ephemeral=True)
         return
-    names = "\n".join(f"• {member.display_name}" for member in members)
+    view = SessionSetupView(guild, interaction.user.id, members)
+    active_session_lobbies[guild.id] = view
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
+
+
+@bot.tree.command(name="세션종료", description="현재 LINKDICE 세션 또는 참가 확인을 종료합니다.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def session_end_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    lobby = active_session_lobbies.get(guild.id)
+    active = get_active_session(guild.id)
+    if active is None and lobby is None:
+        await interaction.response.send_message("진행 중인 세션이나 참가 확인이 없습니다.", ephemeral=True)
+        return
+    if active is None and lobby is not None:
+        lobby.stop()
+        active_session_lobbies.pop(guild.id, None)
+        for item in lobby.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if lobby.message is not None:
+            try:
+                await lobby.message.edit(content="관리자가 세션 준비를 종료했습니다.", embed=None, view=None)
+            except discord.HTTPException:
+                pass
+        await interaction.response.send_message("세션 참가 확인을 종료했습니다.", ephemeral=True)
+        return
     await interaction.response.send_message(
-        content=f"**참가자를 확인해주세요.**\n{names}",
-        view=SessionSetupView(guild, interaction.user.id, members),
+        "현재 LINKDICE 세션을 종료하시겠습니까? 진행 중인 순발력 판정도 취소됩니다.",
+        view=SessionEndConfirmView(guild.id, interaction.user.id),
         ephemeral=True,
     )
 
