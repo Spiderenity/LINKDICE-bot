@@ -8,14 +8,15 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+
+
+
 
 LEVEL_TO_VALUE = {
     1: 30,
@@ -32,27 +33,35 @@ STAT_COLUMNS = {
     "행운": "luck",
 }
 
-# CoC-inspired placeholders for the current weapon boolean system.
-# Change these later if LINKDICE gets real weapon types.
-UNARMED_DAMAGE = os.getenv("UNARMED_DAMAGE", "1d3")
-WEAPON_DAMAGE = os.getenv("WEAPON_DAMAGE", "1d6")
+
+
 DEFAULT_ENEMY_DAMAGE = os.getenv("ENEMY_DAMAGE_DICE", "1d6")
+LINK_API_URL = os.getenv("LINK_API_URL", "").rstrip("/")
+LINKDICE_API_KEY = os.getenv("LINKDICE_API_KEY", "").strip()
+LINK_API_TIMEOUT = float(os.getenv("LINK_API_TIMEOUT", "4"))
+FALLBACK_WEAPON_NAME = "유리 파편"
+FALLBACK_ATTACK_POWER = 4
+FALLBACK_SHIELD_NAME = "화물 상자 뚜껑"
+FALLBACK_DEFENSE_POWER = 1
+FALLBACK_HP = 20
+FALLBACK_BOMBS = 2
+BOMB_DAMAGE_MIN = 10
+BOMB_DAMAGE_MAX = 14
 
 PLAYER_ROLE_NAME = os.getenv("PLAYER_ROLE_NAME", "player")
 
-# Discord's checkbox group supports up to 10 options in a modal.
+
 MAX_TURN_CHECKBOX_ACTIONS = 10
 
 DICE_RE = re.compile(r"^(?P<count>\d{1,2})d(?P<sides>\d{1,4})(?P<mod>[+-]\d{1,4})?$", re.I)
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+
+
+
 
 
 def get_db_path() -> Path:
-    """Use the Railway volume when attached, otherwise ./data locally."""
     railway_volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
     data_dir = Path(railway_volume) if railway_volume else Path("data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -85,7 +94,7 @@ def init_db() -> None:
                 max_hp INTEGER,
                 special_name TEXT,
                 special_level INTEGER,
-                has_weapon INTEGER NOT NULL DEFAULT 0,
+                bombs INTEGER,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (guild_id, user_id)
             );
@@ -123,8 +132,17 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_turn_actions_guild
             ON turn_actions (guild_id, resolved, id);
+
+            CREATE TABLE IF NOT EXISTS sync_settings (
+                guild_id INTEGER PRIMARY KEY,
+                hp_sync INTEGER NOT NULL DEFAULT 1,
+                bombs_sync INTEGER NOT NULL DEFAULT 1
+            );
             """
         )
+        player_columns = {row[1] for row in conn.execute("PRAGMA table_info(player_stats)")}
+        if "bombs" not in player_columns:
+            conn.execute("ALTER TABLE player_stats ADD COLUMN bombs INTEGER")
         conn.commit()
 
 
@@ -164,7 +182,7 @@ def update_player_fields(guild_id: int, user_id: int, **fields: object) -> None:
         "max_hp",
         "special_name",
         "special_level",
-        "has_weapon",
+        "bombs",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -185,6 +203,43 @@ def update_player_fields(guild_id: int, user_id: int, **fields: object) -> None:
             values,
         )
         conn.commit()
+
+
+def get_sync_settings(guild_id: int) -> tuple[bool, bool]:
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_settings (guild_id) VALUES (?)",
+            (guild_id,),
+        )
+        row = conn.execute(
+            "SELECT hp_sync, bombs_sync FROM sync_settings WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+        conn.commit()
+    return bool(row["hp_sync"]), bool(row["bombs_sync"])
+
+
+def set_sync_settings(
+    guild_id: int,
+    hp_sync: Optional[bool] = None,
+    bombs_sync: Optional[bool] = None,
+) -> tuple[bool, bool]:
+    current_hp, current_bombs = get_sync_settings(guild_id)
+    next_hp = current_hp if hp_sync is None else hp_sync
+    next_bombs = current_bombs if bombs_sync is None else bombs_sync
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO sync_settings (guild_id, hp_sync, bombs_sync)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                hp_sync = excluded.hp_sync,
+                bombs_sync = excluded.bombs_sync
+            """,
+            (guild_id, int(next_hp), int(next_bombs)),
+        )
+        conn.commit()
+    return next_hp, next_bombs
 
 
 def get_active_enemies(guild_id: int, include_down: bool = True) -> list[sqlite3.Row]:
@@ -319,9 +374,9 @@ def resolve_all_pending_actions(guild_id: int) -> None:
         conn.commit()
 
 
-# ============================================================
-# DICE + RESULT RULES
-# ============================================================
+
+
+
 
 
 def roll_d100() -> int:
@@ -329,7 +384,6 @@ def roll_d100() -> int:
 
 
 def judge_roll(roll: int, target: int) -> tuple[str, bool]:
-    """CoC-style percentile grading used as the current LINKDICE placeholder."""
     if roll == 1:
         return "대성공", True
 
@@ -349,7 +403,6 @@ def judge_roll(roll: int, target: int) -> tuple[str, bool]:
 
 
 def parse_and_roll_dice(expression: str) -> tuple[int, list[int], int]:
-    """Roll a restricted dice expression such as 1d6, 2d4+1, or 1d8-1."""
     normalized = expression.replace(" ", "").lower()
     match = DICE_RE.fullmatch(normalized)
     if not match:
@@ -369,8 +422,8 @@ def parse_and_roll_dice(expression: str) -> tuple[int, list[int], int]:
     return total, rolls, modifier
 
 
-def damage_expression_for_player(player: sqlite3.Row) -> str:
-    return WEAPON_DAMAGE if bool(player["has_weapon"]) else UNARMED_DAMAGE
+def damage_expression_for_attack_power(attack_power: int) -> str:
+    return f"1d{max(1, attack_power)}"
 
 
 def format_dice_roll(expression: str, rolls: list[int], modifier: int, total: int) -> str:
@@ -382,9 +435,112 @@ def format_dice_roll(expression: str, rolls: list[int], modifier: int, total: in
     return f"`{expression}` → {detail} = **{total}**"
 
 
-# ============================================================
-# DISPLAY HELPERS
-# ============================================================
+def fallback_link_profile() -> dict:
+    return {
+        "weapon": {"name": FALLBACK_WEAPON_NAME, "power": FALLBACK_ATTACK_POWER},
+        "ring": None,
+        "shield": {"name": FALLBACK_SHIELD_NAME, "power": FALLBACK_DEFENSE_POWER, "hp_bonus": 0},
+        "head": None,
+        "attack_power": FALLBACK_ATTACK_POWER,
+        "defense_power": FALLBACK_DEFENSE_POWER,
+        "hp": FALLBACK_HP,
+        "max_hp": FALLBACK_HP,
+        "bombs": FALLBACK_BOMBS,
+    }
+
+
+async def link_api_request(
+    method: str,
+    guild_id: int,
+    user_id: int,
+    payload: Optional[dict] = None,
+) -> Optional[dict]:
+    if not LINK_API_URL or not LINKDICE_API_KEY:
+        return None
+    url = f"{LINK_API_URL}/linkdice/player/{guild_id}/{user_id}"
+    headers = {"Authorization": f"Bearer {LINKDICE_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=LINK_API_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(method, url, headers=headers, json=payload) as response:
+                if response.status >= 400:
+                    return None
+                return await response.json()
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return None
+
+
+async def get_effective_profile(guild_id: int, user_id: int) -> tuple[dict, bool]:
+    ensure_player(guild_id, user_id)
+    local = get_player(guild_id, user_id)
+    remote = await link_api_request("GET", guild_id, user_id)
+    connected = remote is not None
+    profile = remote if remote is not None else fallback_link_profile()
+    hp_sync, bombs_sync = get_sync_settings(guild_id)
+
+    if remote is not None and hp_sync:
+        update_player_fields(
+            guild_id,
+            user_id,
+            hp=int(remote["hp"]),
+            max_hp=int(remote["max_hp"]),
+        )
+        local = get_player(guild_id, user_id)
+    elif local is None or local["hp"] is None or local["max_hp"] is None:
+        update_player_fields(
+            guild_id,
+            user_id,
+            hp=int(profile["hp"]),
+            max_hp=int(profile["max_hp"]),
+        )
+        local = get_player(guild_id, user_id)
+
+    if remote is not None and bombs_sync:
+        update_player_fields(guild_id, user_id, bombs=int(remote["bombs"]))
+        local = get_player(guild_id, user_id)
+    elif local is None or local["bombs"] is None:
+        update_player_fields(guild_id, user_id, bombs=int(profile["bombs"]))
+        local = get_player(guild_id, user_id)
+
+    if local is not None:
+        if not hp_sync or remote is None:
+            profile["hp"] = int(local["hp"])
+            profile["max_hp"] = int(local["max_hp"])
+        if not bombs_sync or remote is None:
+            profile["bombs"] = int(local["bombs"])
+
+    return profile, connected
+
+
+async def write_link_resources(
+    guild_id: int,
+    user_id: int,
+    hp: Optional[int] = None,
+    bombs: Optional[int] = None,
+) -> bool:
+    payload = {}
+    if hp is not None:
+        payload["hp"] = int(hp)
+    if bombs is not None:
+        payload["bombs"] = int(bombs)
+    if not payload:
+        return True
+    result = await link_api_request("PATCH", guild_id, user_id, payload)
+    if result is None:
+        return False
+    fields = {}
+    if "hp" in payload:
+        fields["hp"] = int(result["hp"])
+        fields["max_hp"] = int(result["max_hp"])
+    if "bombs" in payload:
+        fields["bombs"] = int(result["bombs"])
+    update_player_fields(guild_id, user_id, **fields)
+    return True
+
+
+
+
+
 
 
 def enemy_display_name(enemy: sqlite3.Row) -> str:
@@ -410,22 +566,64 @@ def member_label(guild: discord.Guild, user_id: int) -> str:
     return member.display_name if member else f"<@{user_id}>"
 
 
-# ============================================================
-# BOT
-# ============================================================
+def result_color(result: str) -> discord.Colour:
+    if result == "대성공":
+        return discord.Colour.gold()
+    if result in ("극단적 성공", "어려운 성공", "성공"):
+        return discord.Colour.green()
+    if result == "대실패":
+        return discord.Colour.red()
+    return discord.Colour.light_grey()
+
+
+def make_roll_embed(
+    title: str,
+    actor: str,
+    skill_name: str,
+    level: int,
+    target: int,
+    roll: int,
+    result: str,
+    footer: Optional[str] = None,
+    target_name: Optional[str] = None,
+) -> discord.Embed:
+    lines = [f"캐릭터 · `{actor}`"]
+    if target_name:
+        lines.append(f"대상 · `{target_name}`")
+    lines.extend(
+        [
+            f"판정 · `{skill_name}`",
+            f"수치 · `Lv.{level}` → **{target}**",
+            f"다이스 · `1d100` → **{roll}**",
+            f"결과 · **{result}**",
+        ]
+    )
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+        color=result_color(result),
+    )
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+
+
+
 
 
 class LinkDiceBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        # Needed so the /플레이어 공격 autocomplete can reliably inspect @player role members.
+        
         intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
         init_db()
 
-        # Groups are added before sync.
+        
         self.tree.add_command(enemy_group)
         self.tree.add_command(player_group)
         self.tree.add_command(turn_group)
@@ -450,9 +648,9 @@ async def on_ready() -> None:
     print(f"Database: {DB_PATH}")
 
 
-# ============================================================
-# AUTOCOMPLETE
-# ============================================================
+
+
+
 
 
 async def enemy_autocomplete(
@@ -532,9 +730,9 @@ async def player_role_autocomplete(
     return choices
 
 
-# ============================================================
-# COMMON SKILL ROLL
-# ============================================================
+
+
+
 
 
 async def perform_skill_roll(
@@ -573,18 +771,22 @@ async def perform_skill_roll(
         success=success,
     )
 
-    await interaction.response.send_message(
-        f"**{interaction.user.display_name} — {display_name}**\n"
-        f"수치: **Lv.{level} → {target}**\n"
-        f"1d100: **{roll}**\n"
-        f"결과: **{result}**\n"
-        "*이번 턴 판정으로 기록되었습니다.*"
+    embed = make_roll_embed(
+        title=display_name,
+        actor=interaction.user.display_name,
+        skill_name=display_name,
+        level=level,
+        target=target,
+        roll=roll,
+        result=result,
+        footer="이번 턴 판정으로 기록되었습니다.",
     )
+    await interaction.response.send_message(embed=embed)
 
 
-# ============================================================
-# BASIC PLAYER COMMANDS
-# ============================================================
+
+
+
 
 
 @bot.tree.command(name="공격", description="에너미를 대상으로 공격 판정을 합니다.")
@@ -639,18 +841,22 @@ async def attack(interaction: discord.Interaction, enemy: str) -> None:
     )
 
     suffix = (
-        "**데미지는 `/턴 종료`에서 확정됩니다.**"
+        "데미지는 /턴 종료에서 확정됩니다."
         if success
         else "공격에 실패하여 데미지가 발생하지 않습니다."
     )
-
-    await interaction.response.send_message(
-        f"**{interaction.user.display_name} → {enemy_display_name(target_enemy)}**\n"
-        f"공격 Lv.{level} → **{target}**\n"
-        f"1d100: **{roll}**\n"
-        f"결과: **{result}**\n"
-        f"{suffix}"
+    embed = make_roll_embed(
+        title="공격",
+        actor=interaction.user.display_name,
+        target_name=enemy_display_name(target_enemy),
+        skill_name="공격",
+        level=level,
+        target=target,
+        roll=roll,
+        result=result,
+        footer=suffix,
     )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="민첩", description="민첩 판정을 합니다.")
@@ -707,18 +913,22 @@ async def special(interaction: discord.Interaction) -> None:
         success=success,
     )
 
-    await interaction.response.send_message(
-        f"**{interaction.user.display_name} — 특수: {special_name}**\n"
-        f"수치: **Lv.{level} → {target}**\n"
-        f"1d100: **{roll}**\n"
-        f"결과: **{result}**\n"
-        "*이번 턴 판정으로 기록되었습니다.*"
+    embed = make_roll_embed(
+        title=f"특수 · {special_name}",
+        actor=interaction.user.display_name,
+        skill_name=f"특수: {special_name}",
+        level=level,
+        target=target,
+        roll=roll,
+        result=result,
+        footer="이번 턴 판정으로 기록되었습니다.",
     )
+    await interaction.response.send_message(embed=embed)
 
 
-# ============================================================
-# ADMIN: PLAYER SETUP
-# ============================================================
+
+
+
 
 
 @bot.tree.command(name="세팅", description="플레이어의 LINKDICE 능력치를 설정합니다.")
@@ -731,7 +941,6 @@ async def special(interaction: discord.Interaction) -> None:
     agility_value="민첩",
     intelligence_value="지능",
     luck_value="행운",
-    hp_value="체력",
     special_name="특수",
     special_value="특수값",
 )
@@ -741,7 +950,6 @@ async def special(interaction: discord.Interaction) -> None:
     agility_value="민첩 레벨 (1~5)",
     intelligence_value="지능 레벨 (1~5)",
     luck_value="행운 레벨 (1~5)",
-    hp_value="최대 체력. 입력하면 현재 체력도 이 값으로 회복됩니다.",
     special_name="특수 능력 이름 (예: 재봉)",
     special_value="특수 능력 레벨 (1~5)",
 )
@@ -752,7 +960,6 @@ async def setup_stats(
     agility_value: Optional[int] = None,
     intelligence_value: Optional[int] = None,
     luck_value: Optional[int] = None,
-    hp_value: Optional[int] = None,
     special_name: Optional[str] = None,
     special_value: Optional[int] = None,
 ) -> None:
@@ -762,29 +969,19 @@ async def setup_stats(
             "능력치 레벨은 **1~5** 사이여야 합니다.", ephemeral=True
         )
         return
-
-    if hp_value is not None and hp_value < 1:
-        await interaction.response.send_message(
-            "체력은 1 이상이어야 합니다.", ephemeral=True
-        )
-        return
-
     if (special_name is None) != (special_value is None):
         await interaction.response.send_message(
             "특수를 설정하려면 **특수 이름**과 **특수값**을 함께 입력해주세요.",
             ephemeral=True,
         )
         return
-
-    if all(value is None for value in levels) and hp_value is None and special_name is None:
+    if all(value is None for value in levels) and special_name is None:
         await interaction.response.send_message(
             "변경할 값을 하나 이상 입력해주세요.", ephemeral=True
         )
         return
-
     fields: dict[str, object] = {}
     changes: list[str] = []
-
     for column, value, label in (
         ("attack", attack_value, "공격"),
         ("agility", agility_value, "민첩"),
@@ -794,12 +991,6 @@ async def setup_stats(
         if value is not None:
             fields[column] = value
             changes.append(f"{label}: Lv.{value} ({LEVEL_TO_VALUE[value]})")
-
-    if hp_value is not None:
-        fields["hp"] = hp_value
-        fields["max_hp"] = hp_value
-        changes.append(f"체력: {hp_value}/{hp_value}")
-
     if special_name is not None and special_value is not None:
         cleaned_name = special_name.strip()
         if not cleaned_name:
@@ -812,40 +1003,14 @@ async def setup_stats(
         changes.append(
             f"특수: {cleaned_name} Lv.{special_value} ({LEVEL_TO_VALUE[special_value]})"
         )
-
     update_player_fields(interaction.guild_id, member.id, **fields)
-
     await interaction.response.send_message(
         f"**{member.display_name}** 설정 완료\n" + "\n".join(f"- {c}" for c in changes),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="무기", description="플레이어의 무기 보유 상태를 설정합니다.")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.rename(member="유저", equipped="보유")
-@app_commands.describe(member="설정할 유저", equipped="무기를 들고 있으면 True")
-async def weapon(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    equipped: bool,
-) -> None:
-    update_player_fields(
-        interaction.guild_id,
-        member.id,
-        has_weapon=int(equipped),
-    )
-    expression = WEAPON_DAMAGE if equipped else UNARMED_DAMAGE
-    await interaction.response.send_message(
-        f"**{member.display_name}** 무기: **{'보유' if equipped else '미보유'}**\n"
-        f"현재 데미지식: `{expression}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="스탯", description="LINKDICE 능력치를 확인합니다.")
+@bot.tree.command(name="스탯", description="LINKDICE 능력치와 LINK 장비를 확인합니다.")
 @app_commands.guild_only()
 @app_commands.rename(member="유저")
 @app_commands.describe(member="생략하면 자신의 스탯을 확인합니다.")
@@ -855,49 +1020,147 @@ async def stats(
 ) -> None:
     if interaction.guild_id is None:
         return
-
     target_member = member or interaction.user
+    ensure_player(interaction.guild_id, target_member.id)
     player = get_player(interaction.guild_id, target_member.id)
-    if player is None:
-        await interaction.response.send_message(
-            f"{target_member.mention}님의 능력치가 아직 설정되지 않았습니다.",
-            ephemeral=True,
-        )
-        return
-
-    hp_text = (
-        f"{player['hp']}/{player['max_hp']}"
-        if player["hp"] is not None and player["max_hp"] is not None
-        else "미설정"
-    )
+    profile, connected = await get_effective_profile(interaction.guild_id, target_member.id)
     special_text = (
         f"{player['special_name']} — {stat_text(player['special_level'])}"
         if player["special_name"] is not None and player["special_level"] is not None
         else "미설정"
     )
-    weapon_text = "보유" if player["has_weapon"] else "미보유"
+    ring = profile.get("ring")
+    head = profile.get("head")
+    hp_sync, bombs_sync = get_sync_settings(interaction.guild_id)
+    embed = discord.Embed(title=f"{target_member.display_name} · LINKDICE")
+    embed.add_field(
+        name="판정",
+        value=(
+            f"공격 · {stat_text(player['attack'])}\n"
+            f"민첩 · {stat_text(player['agility'])}\n"
+            f"지능 · {stat_text(player['intelligence'])}\n"
+            f"행운 · {stat_text(player['luck'])}\n"
+            f"특수 · {special_text}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="LINK",
+        value=(
+            f"체력 · **{profile['hp']}/{profile['max_hp']}**\n"
+            f"공격력 · **{profile['attack_power']}**\n"
+            f"방어력 · **{profile['defense_power']}**\n"
+            f"폭탄 · **{profile['bombs']}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="장비",
+        value=(
+            f"무기 · `{profile['weapon']['name']}` ({profile['weapon']['power']})\n"
+            f"반지 · `{ring['name']}` (+{ring['power']})\n" if ring else f"무기 · `{profile['weapon']['name']}` ({profile['weapon']['power']})\n반지 · `없음`\n"
+        ) + (
+            f"방패 · `{profile['shield']['name']}` ({profile['shield']['power']})\n"
+            f"투구 · `{head['name']}` ({head['power']})" if head else f"방패 · `{profile['shield']['name']}` ({profile['shield']['power']})\n투구 · `없음`"
+        ),
+        inline=False,
+    )
+    source = "LINK 실시간 연결" if connected else "LINK 연결 실패 · 기본 장비/마지막 전투값 사용"
+    embed.set_footer(
+        text=f"{source} · 체력 양방향 {'ON' if hp_sync else 'OFF'} · 폭탄 양방향 {'ON' if bombs_sync else 'OFF'}"
+    )
+    await interaction.response.send_message(embed=embed)
 
+
+@bot.tree.command(name="동기화", description="LINK의 체력과 폭탄을 LINKDICE로 다시 불러옵니다.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.rename(member="유저")
+async def sync_from_link(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    if interaction.guild_id is None:
+        return
+    remote = await link_api_request("GET", interaction.guild_id, member.id)
+    if remote is None:
+        await interaction.response.send_message(
+            "LINK와 연결할 수 없습니다. LINK_API_URL과 LINKDICE_API_KEY를 확인해주세요.",
+            ephemeral=True,
+        )
+        return
+    update_player_fields(
+        interaction.guild_id,
+        member.id,
+        hp=int(remote["hp"]),
+        max_hp=int(remote["max_hp"]),
+        bombs=int(remote["bombs"]),
+    )
     await interaction.response.send_message(
-        f"**{target_member.display_name} — LINKDICE 스탯**\n"
-        f"공격: {stat_text(player['attack'])}\n"
-        f"민첩: {stat_text(player['agility'])}\n"
-        f"지능: {stat_text(player['intelligence'])}\n"
-        f"행운: {stat_text(player['luck'])}\n"
-        f"특수: {special_text}\n"
-        f"체력: **{hp_text}**\n"
-        f"무기: **{weapon_text}**"
+        f"**{member.display_name}** 동기화 완료 · HP {remote['hp']}/{remote['max_hp']} · 폭탄 {remote['bombs']}",
+        ephemeral=True,
     )
 
 
-# ============================================================
-# /에너미 ...
-# ============================================================
+@bot.tree.command(name="디버그", description="LINK 연동과 전투 자원을 조정합니다.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.rename(
+    member="유저",
+    hp="체력",
+    bombs="폭탄",
+    hp_sync="체력연동",
+    bombs_sync="폭탄연동",
+)
+async def debug_sync(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+    hp: Optional[int] = None,
+    bombs: Optional[int] = None,
+    hp_sync: Optional[bool] = None,
+    bombs_sync: Optional[bool] = None,
+) -> None:
+    if interaction.guild_id is None:
+        return
+    current_hp_sync, current_bombs_sync = set_sync_settings(
+        interaction.guild_id, hp_sync, bombs_sync
+    )
+    target = member or interaction.user
+    profile, connected = await get_effective_profile(interaction.guild_id, target.id)
+    if hp is not None:
+        hp = max(0, min(hp, int(profile["max_hp"])))
+        update_player_fields(
+            interaction.guild_id, target.id, hp=hp, max_hp=int(profile["max_hp"])
+        )
+        profile["hp"] = hp
+        if current_hp_sync:
+            connected = await write_link_resources(interaction.guild_id, target.id, hp=hp) and connected
+    if bombs is not None:
+        bombs = max(0, bombs)
+        update_player_fields(interaction.guild_id, target.id, bombs=bombs)
+        profile["bombs"] = bombs
+        if current_bombs_sync:
+            connected = await write_link_resources(interaction.guild_id, target.id, bombs=bombs) and connected
+    await interaction.response.send_message(
+        f"**{target.display_name}** · HP {profile['hp']}/{profile['max_hp']} · 폭탄 {profile['bombs']}\n"
+        f"체력 양방향: **{'ON' if current_hp_sync else 'OFF'}** · "
+        f"폭탄 양방향: **{'ON' if current_bombs_sync else 'OFF'}**\n"
+        f"LINK 연결: **{'정상' if connected else '확인 필요'}**",
+        ephemeral=True,
+    )
+
+
+
+
+
 
 
 enemy_group = app_commands.Group(name="에너미", description="에너미를 관리합니다.")
 
 
-@enemy_group.command(name="등장", description="새 에너미를 현재 장면에 등장시킵니다.")
+@bot.tree.command(name="등장", description="새 에너미를 현재 장면에 등장시킵니다.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -920,10 +1183,13 @@ async def enemy_spawn(
         return
 
     enemy_id = spawn_enemy(interaction.guild_id, clean_name, hp)
-    await interaction.response.send_message(
-        f"**{clean_name} #{enemy_id}** 등장\n"
-        f"HP {hp_bar(hp, hp)} **{hp}/{hp}**"
+    embed = discord.Embed(
+        title=f"{clean_name} #{enemy_id}",
+        description=f"체력 · {hp_bar(hp, hp)} **{hp}/{hp}**",
+        color=discord.Colour.light_grey(),
     )
+    embed.set_footer(text="현재 장면에 등장했습니다.")
+    await interaction.response.send_message(embed=embed)
 
 
 @enemy_group.command(name="목록", description="현재 장면의 에너미를 확인합니다.")
@@ -937,17 +1203,15 @@ async def enemy_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("현재 등장한 에너미가 없습니다.")
         return
 
-    lines = ["**현재 에너미**"]
+    embed = discord.Embed(title="현재 장면", color=discord.Colour.light_grey())
     for enemy in enemies:
         if enemy["hp"] <= 0:
-            lines.append(f"- **{enemy_display_name(enemy)}** — `DOWN`")
+            value = "`DOWN`"
         else:
-            lines.append(
-                f"- **{enemy_display_name(enemy)}** — "
-                f"{hp_bar(enemy['hp'], enemy['max_hp'])} "
-                f"{enemy['hp']}/{enemy['max_hp']}"
-            )
-    await interaction.response.send_message("\n".join(lines))
+            value = f"{hp_bar(enemy['hp'], enemy['max_hp'])} **{enemy['hp']}/{enemy['max_hp']}**"
+        embed.add_field(name=enemy_display_name(enemy), value=value, inline=False)
+    embed.set_footer(text="현재 등장한 에너미입니다.")
+    await interaction.response.send_message(embed=embed)
 
 
 @enemy_group.command(name="퇴장", description="에너미를 현재 장면에서 제거합니다.")
@@ -980,9 +1244,9 @@ async def enemy_remove(interaction: discord.Interaction, enemy: str) -> None:
     )
 
 
-# ============================================================
-# /플레이어 공격
-# ============================================================
+
+
+
 
 
 player_group = app_commands.Group(name="플레이어", description="플레이어 대상 GM 명령입니다.")
@@ -999,7 +1263,6 @@ async def player_attack(interaction: discord.Interaction, player: str) -> None:
     guild = interaction.guild
     if guild is None:
         return
-
     try:
         user_id = int(player)
     except ValueError:
@@ -1008,14 +1271,12 @@ async def player_attack(interaction: discord.Interaction, player: str) -> None:
             ephemeral=True,
         )
         return
-
     member = guild.get_member(user_id)
     if member is None:
         await interaction.response.send_message(
             "해당 플레이어를 서버에서 찾을 수 없습니다.", ephemeral=True
         )
         return
-
     role = discord.utils.get(guild.roles, name=PLAYER_ROLE_NAME)
     if role is None:
         await interaction.response.send_message(
@@ -1028,53 +1289,124 @@ async def player_attack(interaction: discord.Interaction, player: str) -> None:
             ephemeral=True,
         )
         return
-
-    stats_row = get_player(guild.id, member.id)
-    if stats_row is None or stats_row["hp"] is None or stats_row["max_hp"] is None:
-        await interaction.response.send_message(
-            f"{member.mention}님의 체력이 설정되어 있지 않습니다. `/세팅`에서 체력을 설정해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    old_hp = int(stats_row["hp"])
-    max_hp = int(stats_row["max_hp"])
+    profile, connected = await get_effective_profile(guild.id, member.id)
+    old_hp = int(profile["hp"])
+    max_hp = int(profile["max_hp"])
     if old_hp <= 0:
         await interaction.response.send_message(
             f"{member.mention}님은 이미 **DOWN** 상태입니다.", ephemeral=True
         )
         return
-
     try:
-        damage, rolls, modifier = parse_and_roll_dice(DEFAULT_ENEMY_DAMAGE)
+        raw_damage, rolls, modifier = parse_and_roll_dice(DEFAULT_ENEMY_DAMAGE)
     except ValueError as exc:
         await interaction.response.send_message(
             f"ENEMY_DAMAGE_DICE 설정 오류: {exc}", ephemeral=True
         )
         return
-
+    defense_power = max(0, int(profile["defense_power"]))
+    defense_roll = random.randint(1, defense_power) if defense_power > 0 else 0
+    damage = max(0, raw_damage - defense_roll)
     new_hp = max(0, old_hp - damage)
-    update_player_fields(guild.id, member.id, hp=new_hp)
-
-    down = "\n**DOWN**" if new_hp <= 0 else ""
-    await interaction.response.send_message(
-        f"**에너미 → {member.display_name}**\n"
-        f"데미지: {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, damage)}\n"
-        f"HP {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**"
-        f"{down}"
+    update_player_fields(guild.id, member.id, hp=new_hp, max_hp=max_hp)
+    hp_sync, _ = get_sync_settings(guild.id)
+    synced = True
+    if hp_sync:
+        synced = await write_link_resources(guild.id, member.id, hp=new_hp)
+    embed = discord.Embed(
+        title="플레이어 공격",
+        description=(
+            f"대상 · `{member.display_name}`\n"
+            f"공격 · {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, raw_damage)}\n"
+            f"방어 · `1d{defense_power}` → **{defense_roll}**\n" if defense_power > 0 else
+            f"대상 · `{member.display_name}`\n"
+            f"공격 · {format_dice_roll(DEFAULT_ENEMY_DAMAGE, rolls, modifier, raw_damage)}\n"
+            f"방어 · **0**\n"
+        ) + (
+            f"피해 · **{damage}**\n"
+            f"체력 · {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**"
+            + ("\n상태 · **DOWN**" if new_hp <= 0 else "")
+        ),
+        color=discord.Colour.red() if damage > 0 else discord.Colour.green(),
     )
+    footer = "에너미의 공격은 즉시 적용됩니다."
+    if hp_sync and (not connected or not synced):
+        footer += " · LINK 체력 동기화 실패"
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
 
 
-# ============================================================
-# TURN END RESOLUTION
-# ============================================================
+@bot.tree.command(name="폭탄", description="LINK의 폭탄을 사용해 에너미에게 즉시 피해를 줍니다.")
+@app_commands.guild_only()
+@app_commands.rename(enemy="에너미")
+@app_commands.autocomplete(enemy=enemy_autocomplete)
+async def bomb_attack(interaction: discord.Interaction, enemy: str) -> None:
+    if interaction.guild_id is None:
+        return
+    try:
+        enemy_id = int(enemy)
+    except ValueError:
+        await interaction.response.send_message(
+            "현재 등장 중인 에너미를 목록에서 선택해주세요.", ephemeral=True
+        )
+        return
+    target_enemy = get_enemy(interaction.guild_id, enemy_id)
+    if target_enemy is None or target_enemy["hp"] <= 0:
+        await interaction.response.send_message(
+            "그 에너미는 현재 공격할 수 없습니다.", ephemeral=True
+        )
+        return
+    profile, connected = await get_effective_profile(interaction.guild_id, interaction.user.id)
+    bombs = int(profile["bombs"])
+    if bombs <= 0:
+        await interaction.response.send_message("폭탄이 없습니다.", ephemeral=True)
+        return
+    damage = random.randint(BOMB_DAMAGE_MIN, BOMB_DAMAGE_MAX)
+    next_bombs = bombs - 1
+    old_hp = int(target_enemy["hp"])
+    max_hp = int(target_enemy["max_hp"])
+    new_hp = max(0, old_hp - damage)
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE active_enemies SET hp = ? WHERE guild_id = ? AND id = ?",
+            (new_hp, interaction.guild_id, enemy_id),
+        )
+        conn.commit()
+    update_player_fields(interaction.guild_id, interaction.user.id, bombs=next_bombs)
+    _, bombs_sync = get_sync_settings(interaction.guild_id)
+    synced = True
+    if bombs_sync:
+        synced = await write_link_resources(
+            interaction.guild_id, interaction.user.id, bombs=next_bombs
+        )
+    embed = discord.Embed(
+        title="폭탄",
+        description=(
+            f"캐릭터 · `{interaction.user.display_name}`\n"
+            f"대상 · `{enemy_display_name(target_enemy)}`\n"
+            f"피해 · **{damage}**\n"
+            f"에너미 체력 · {hp_bar(new_hp, max_hp)} **{old_hp} → {new_hp}/{max_hp}**\n"
+            f"남은 폭탄 · **{next_bombs}**"
+            + ("\n상태 · **DOWN**" if new_hp <= 0 else "")
+        ),
+        color=discord.Colour.orange(),
+    )
+    footer = "폭탄 피해는 즉시 적용됩니다."
+    if bombs_sync and (not connected or not synced):
+        footer += " · LINK 폭탄 동기화 실패"
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
+
+
+
+
+
 
 
 async def resolve_turn(
     guild: discord.Guild,
     channel: discord.abc.Messageable,
 ) -> str:
-    """Roll damage for all successful attack-marked actions, then apply totals."""
     actions = get_pending_actions(guild.id)
     if not actions:
         return "이번 턴에 처리할 판정이 없습니다."
@@ -1099,14 +1431,9 @@ async def resolve_turn(
             )
             continue
 
-        player = get_player(guild.id, int(action["user_id"]))
-        if player is None:
-            skipped.append(
-                f"{member_label(guild, action['user_id'])} — 플레이어 데이터 없음"
-            )
-            continue
-
-        expression = damage_expression_for_player(player)
+        profile, connected = await get_effective_profile(guild.id, int(action["user_id"]))
+        attack_power_value = max(0, int(profile["attack_power"]))
+        expression = damage_expression_for_attack_power(attack_power_value)
         try:
             damage, rolls, modifier = parse_and_roll_dice(expression)
         except ValueError as exc:
@@ -1127,6 +1454,8 @@ async def resolve_turn(
                 "rolls": rolls,
                 "modifier": modifier,
                 "damage": damage,
+                "attack_power": attack_power_value,
+                "weapon_name": profile["weapon"]["name"],
             }
         )
 
@@ -1168,29 +1497,29 @@ async def resolve_turn(
         )
         conn.commit()
 
-    lines = ["## 턴 결과"]
-
+    embed = discord.Embed(title="턴 결과", color=discord.Colour.blurple())
     if damage_entries:
         for entry in damage_entries:
-            lines.append(
-                f"**{member_label(guild, entry['user_id'])} → {entry['enemy_name']}** "
-                f"({entry['skill_name']})\n"
-                f"{format_dice_roll(entry['expression'], entry['rolls'], entry['modifier'], entry['damage'])} DAMAGE"
+            embed.add_field(
+                name=f"{member_label(guild, entry['user_id'])} → {entry['enemy_name']}",
+                value=(
+                    f"판정 · `{entry['skill_name']}`\n"
+                    f"무기 · `{entry['weapon_name']}` · 공격력 **{entry['attack_power']}**\n"
+                    f"데미지 · {format_dice_roll(entry['expression'], entry['rolls'], entry['modifier'], entry['damage'])}"
+                ),
+                inline=False,
             )
     else:
-        lines.append("이번 턴에 적용되는 데미지가 없습니다.")
-
-    if enemy_summaries:
-        lines.append("### 에너미 상태")
-        lines.extend(enemy_summaries)
-
+        embed.description = "이번 턴에 적용되는 데미지가 없습니다."
+    for summary in enemy_summaries:
+        embed.add_field(name="\u200b", value=summary, inline=False)
+    footer_parts = []
     if skipped:
-        lines.append("### 처리 제외")
-        lines.extend(f"- {item}" for item in skipped)
-
-    result = "\n\n".join(lines)
-    await channel.send(result)
-    return result
+        footer_parts.append("처리 제외: " + " / ".join(skipped))
+    footer_parts.append("턴의 공격 데미지가 확정되었습니다.")
+    embed.set_footer(text=" · ".join(footer_parts)[:2048])
+    await channel.send(embed=embed)
+    return "턴 종료 처리 완료."
 
 
 class TargetSelect(discord.ui.Select):
@@ -1365,7 +1694,7 @@ async def turn_end(interaction: discord.Interaction) -> None:
         )
         return
 
-    # Only successful non-/공격 checks need the admin checkbox.
+    
     optional_attack_actions = [
         action
         for action in actions
@@ -1396,9 +1725,9 @@ async def turn_end(interaction: discord.Interaction) -> None:
     )
 
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
+
+
+
 
 
 @bot.tree.error
@@ -1420,9 +1749,9 @@ async def on_app_command_error(
         await interaction.response.send_message(message, ephemeral=True)
 
 
-# ============================================================
-# START
-# ============================================================
+
+
+
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
